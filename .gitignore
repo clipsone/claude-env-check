@@ -1,0 +1,19 @@
+# Build artifacts & packaged installers
+build/
+*.app/
+*.dmg
+*.pkg
+
+# macOS & IDE metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+
+# Swift / Xcode local state
+.build/
+.swiftpm/
+xcuserdata/
+*.xcworkspace/xcuserdata/
