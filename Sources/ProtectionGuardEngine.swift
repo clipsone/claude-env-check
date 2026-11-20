@@ -33,6 +33,7 @@ final class ProtectionGuardEngine: ObservableObject {
     private static let strictIPLockKey = "guardStrictIPLock.v1"
     private static let injectLocaleKey = "guardInjectProcessLocale.v1"
     private static let modeKey = "guardMode.v1"
+    private static let autoStartGuardKey = "guardAutoStartOnLaunch.v1"
 
     @Published private(set) var protectionStatus: ClashProtection.Status?
     @Published private(set) var phase: Phase = .idle
@@ -40,6 +41,7 @@ final class ProtectionGuardEngine: ObservableObject {
     @Published private(set) var verifying = false
     @Published private(set) var guardPort: Int?
     @Published private(set) var upstreamPort: Int?
+    @Published private(set) var upstreamProtocol: UpstreamProxyProtocol = .httpConnect
     @Published private(set) var pinnedCountry: String?
     @Published private(set) var pinnedIP: String?
     @Published private(set) var lastVerifiedIP: String?
@@ -55,18 +57,33 @@ final class ProtectionGuardEngine: ObservableObject {
     @Published var portOverride = ""
     @Published private(set) var detectedPort: Int? = Clash.detectedPort()
 
-    // Phase 3: Multi-client proxy discovery & Clash/Mihomo External Controller symbiosis
+    // Phase 3 + v1.2: Multi-client proxy discovery, Clash/Mihomo symbiosis & multi-client scripts
     @Published private(set) var discoveredClients: [DiscoveredProxyClient] = []
     @Published private(set) var discoveredControllers: [ClashControllerEndpoint] = []
     @Published private(set) var clashSnapshot: ClashControllerSnapshot?
     @Published private(set) var clashBusy = false
     @Published private(set) var clashError: String?
     @Published private(set) var clashActionNote: String?
+    @Published private(set) var installedScriptTargets: [ProxyScriptTarget] = []
+    @Published var selectedScriptTarget: ProxyScriptTarget = .clashVergeRev {
+        didSet { refreshScriptStatus() }
+    }
     @Published private(set) var clashScriptStatus: ClashScriptStatus = .vergeNotInstalled
     @Published var confirmRestoreVergeScript = false
     @Published var overrideFormat: OverrideFormat = .vergeJS
     @Published var copiedOverride = false
     @Published var selectedSwitchNode = ""
+
+    // v1.2: Login item & silent auto-guard
+    @Published private(set) var loginItemState: LoginItemState = LoginItemManager.currentState()
+    @Published private(set) var loginItemNote: String?
+    @Published private(set) var loginItemError: String?
+
+    @Published var autoStartGuardOnLaunch: Bool {
+        didSet {
+            UserDefaults.standard.set(autoStartGuardOnLaunch, forKey: Self.autoStartGuardKey)
+        }
+    }
 
     @Published var selectedMode: ClashProtection.Mode {
         didSet {
@@ -103,6 +120,7 @@ final class ProtectionGuardEngine: ObservableObject {
         self.selectedMode = savedMode
         self.strictIPLock = UserDefaults.standard.bool(forKey: Self.strictIPLockKey)
         self.injectProcessLocale = UserDefaults.standard.bool(forKey: Self.injectLocaleKey)
+        self.autoStartGuardOnLaunch = UserDefaults.standard.bool(forKey: Self.autoStartGuardKey)
     }
 
     var portHint: String {
@@ -161,10 +179,57 @@ final class ProtectionGuardEngine: ObservableObject {
     }
 
     func bootstrap() async {
+        loginItemState = LoginItemManager.currentState()
         await refreshAuditLog()
         await refreshProtectionStatus()
         await refreshSymbiosis()
         requestNotificationAuthorizationIfBundled()
+        if autoStartGuardOnLaunch && !isGuardProxyRunning {
+            await autoStartGuardAfterLaunch()
+        }
+    }
+
+    func refreshLoginItemState() {
+        loginItemState = LoginItemManager.currentState()
+    }
+
+    func setLoginItemEnabled(_ enabled: Bool) {
+        loginItemError = nil
+        loginItemNote = nil
+        do {
+            loginItemState = try LoginItemManager.setEnabled(enabled)
+            if enabled {
+                loginItemNote = loginItemState == .requiresApproval
+                    ? "已登记开机登录项，请在「系统设置 → 通用 → 登录项」中允许。"
+                    : "已开启开机自动启动，重启 Mac 后将自动驻留菜单栏。"
+            } else {
+                loginItemNote = "已关闭开机自动启动。"
+            }
+        } catch {
+            loginItemError = error.localizedDescription
+            loginItemState = LoginItemManager.currentState()
+        }
+    }
+
+    private func autoStartGuardAfterLaunch() async {
+        // If crashed guard state exists, seamlessly recover it
+        if case .recovery(_, .guardProxy, _, _) = protectionStatus {
+            await resumeCrashedGuard()
+            return
+        }
+        guard case .off = protectionStatus else { return }
+        // Give proxy clients (Clash Verge / Mihomo Party) up to 20s after reboot to finish binding local ports
+        for attempt in 0..<10 {
+            if isGuardProxyRunning { return }
+            if (try? resolveTargetUpstreamPort()) != nil {
+                await startProtection()
+                if isGuardProxyRunning { return }
+            }
+            if attempt < 9 {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                await refreshSymbiosis()
+            }
+        }
     }
 
     func refreshAuditLog() async {
@@ -196,8 +261,8 @@ final class ProtectionGuardEngine: ObservableObject {
         discoveredClients = clients
         discoveredControllers = controllers
 
-        if detectedPort == nil, let bestHTTP = clients.first(where: { $0.protocols.supportsHTTP }) {
-            detectedPort = bestHTTP.port
+        if detectedPort == nil, let best = clients.first(where: { $0.protocols.supportsHTTP }) ?? clients.first {
+            detectedPort = best.port
         }
 
         guard !controllers.isEmpty else {
@@ -227,18 +292,28 @@ final class ProtectionGuardEngine: ObservableObject {
     }
 
     func refreshScriptStatus() {
-        clashScriptStatus = ClashVergeScriptInstaller.inspectStatus(liveSnapshot: clashSnapshot)
+        let found = ClashVergeScriptInstaller.discoverInstalledTargets()
+        installedScriptTargets = found
+        if !found.isEmpty && !found.contains(selectedScriptTarget) {
+            selectedScriptTarget = found[0]
+            return
+        }
+        clashScriptStatus = ClashVergeScriptInstaller.inspectStatus(
+            target: selectedScriptTarget,
+            liveSnapshot: clashSnapshot
+        )
     }
 
     func installVergeScript() {
         clashError = nil
         clashActionNote = nil
+        let target = selectedScriptTarget
         let preferred = clashSnapshot?.claudeRoute?.leafNode
         do {
-            let chained = try ClashVergeScriptInstaller.install(preferredNodeName: preferred)
+            let chained = try ClashVergeScriptInstaller.install(target: target, preferredNodeName: preferred)
             refreshScriptStatus()
             let chainNote = chained ? "（已自动保留并串联你原有的自定义脚本）" : ""
-            clashActionNote = "已一键写入 Clash Verge 全局扩展脚本（profiles/Script.js）\(chainNote)。请点「打开 Clash Verge」并刷新/重新启用当前订阅即可立即生效。"
+            clashActionNote = "已一键写入 \(target.displayName) 防泄漏脚本（\(target.relativeScriptPath)）\(chainNote)。\(target.reloadHint)"
         } catch {
             clashError = error.localizedDescription
         }
@@ -247,22 +322,23 @@ final class ProtectionGuardEngine: ObservableObject {
     func restoreVergeScript() {
         clashError = nil
         clashActionNote = nil
+        let target = selectedScriptTarget
         do {
-            try ClashVergeScriptInstaller.restore()
+            try ClashVergeScriptInstaller.restore(target: target)
             refreshScriptStatus()
-            clashActionNote = "已无损还原原始 Clash Verge Script.js。请在 Clash Verge 重载配置以生效。"
+            clashActionNote = "已无损还原 \(target.displayName) 原始脚本。请在客户端重载配置以生效。"
         } catch {
             clashError = error.localizedDescription
         }
     }
 
     func openClashVergeForReload() {
-        ClashVergeScriptInstaller.openClashVergeApp()
+        ClashVergeScriptInstaller.openClientApp(selectedScriptTarget)
     }
 
     func adoptDiscoveredPort(_ port: Int) {
         portOverride = String(port)
-        note = "已选定上游代理端口 127.0.0.1:\(port)。"
+        note = "已选定上游代理端口 127.0.0.1:\(String(port))（启动守卫时将自动识别 HTTP/SOCKS5 协议）。"
     }
 
     func closeClashConnection(id: String) async {
@@ -371,18 +447,27 @@ final class ProtectionGuardEngine: ObservableObject {
 
         do {
             let port = try resolveTargetUpstreamPort()
-            let httpCode = try await Task.detached(priority: .userInitiated) { try Clash.probe(port: port) }.value
-            let geo = await ExitProbes.probeMultiSourceGeo(proxyPort: port)
+            let proto = await detectUpstreamProtocol(port: port)
+            let (_, resp) = try await Diagnostics.httpRequest(
+                URL(string: "https://api.anthropic.com/v1/models")!,
+                headers: ["anthropic-version": "2023-06-01"],
+                proxyPort: port,
+                proxyProtocol: proto,
+                timeout: 6
+            )
+            let httpCode = resp.statusCode
+            let geo = await ExitProbes.probeMultiSourceGeo(proxyPort: port, proxyProtocol: proto)
             let region = ClaudeRegions.displayName(for: geo.primaryCountryCode)
             let support = ClaudeRegions.support(for: geo.primaryCountryCode)
             let ipText = geo.primaryIP ?? "未知 IP"
+            let protoTag = proto == .socks5 ? " · SOCKS5 上游" : ""
             switch support {
             case .supported:
-                note = "代理 127.0.0.1:\(port) 正常（HTTP \(httpCode) · 出口 \(ipText) · \(region) · 支持地区）。"
+                note = "代理 127.0.0.1:\(String(port)) 正常（HTTP \(httpCode)\(protoTag) · 出口 \(ipText) · \(region) · 支持地区）。"
             case .unsupported:
-                issue = "代理 127.0.0.1:\(port) 可连通（HTTP \(httpCode)），但出口位于不支持地区 \(region)（\(ipText)），请先切换节点。"
+                issue = "代理 127.0.0.1:\(String(port)) 可连通（HTTP \(httpCode)\(protoTag)），但出口位于不支持地区 \(region)（\(ipText)），请先切换节点。"
             case .unknown:
-                note = "通过 127.0.0.1:\(port) 收到 Claude API HTTP \(httpCode)，出口地区暂未识别。"
+                note = "通过 127.0.0.1:\(String(port)) 收到 Claude API HTTP \(httpCode)\(protoTag)，出口地区暂未识别。"
             }
         } catch {
             issue = error.localizedDescription
@@ -399,7 +484,7 @@ final class ProtectionGuardEngine: ObservableObject {
 
         do {
             let upstream = try resolveTargetUpstreamPort()
-            let (httpCode, geo, latencyMs) = try await verifyCompliantUpstreamExit(port: upstream)
+            let (httpCode, geo, latencyMs, proto) = try await verifyCompliantUpstreamExit(port: upstream)
             let exitCode = geo.primaryCountryCode!
             let exitIP = geo.primaryIP!
 
@@ -417,12 +502,14 @@ final class ProtectionGuardEngine: ObservableObject {
             }
 
             let localeSuffix = extraEnv.isEmpty ? "" : " · 进程 TZ=\(extraEnv["TZ"] ?? "")"
+            let protoTag = proto == .socks5 ? "SOCKS5 " : ""
 
             if selectedMode == .guardProxy {
                 let server = makeProxyServer()
                 let boundPort = try await server.start(
                     preferredPort: 17899,
                     upstreamPort: upstream,
+                    upstreamProtocol: proto,
                     initialState: .open(exitIP: exitIP, countryCode: exitCode)
                 )
                 do {
@@ -439,6 +526,7 @@ final class ProtectionGuardEngine: ObservableObject {
                 self.proxy = server
                 self.guardPort = boundPort
                 self.upstreamPort = upstream
+                self.upstreamProtocol = proto
                 self.pinnedCountry = exitCode
                 self.pinnedIP = exitIP
                 self.lastVerifiedCountry = exitCode
@@ -449,8 +537,11 @@ final class ProtectionGuardEngine: ObservableObject {
                 self.lastNotifiedTripReason = nil
                 await refreshProtectionStatus()
                 startWatchdogAndObservers()
-                note = "熔断守卫已启动：127.0.0.1:\(boundPort) → :\(upstream)（\(ClaudeRegions.displayName(for: exitCode)) · HTTP \(httpCode)\(localeSuffix)）。请重启 Claude Code 生效。"
+                note = "熔断守卫已启动：127.0.0.1:\(String(boundPort)) → \(protoTag):\(String(upstream))（\(ClaudeRegions.displayName(for: exitCode)) · HTTP \(httpCode)\(localeSuffix)）。请重启 Claude Code 生效。"
             } else {
+                if proto == .socks5 {
+                    throw CircuitBreakerError.listenerFailed("端口 :\(upstream) 为纯 SOCKS5 代理，请切至「熔断守卫模式」（本地网关会自动将 HTTP 桥接至 SOCKS5 上游）。")
+                }
                 try await protection.start(
                     port: upstream,
                     mode: .directClash,
@@ -459,6 +550,7 @@ final class ProtectionGuardEngine: ObservableObject {
                 )
                 self.guardPort = nil
                 self.upstreamPort = upstream
+                self.upstreamProtocol = proto
                 self.pinnedCountry = exitCode
                 self.pinnedIP = exitIP
                 self.lastVerifiedCountry = exitCode
@@ -467,7 +559,7 @@ final class ProtectionGuardEngine: ObservableObject {
                 self.lastCheckedAt = Date()
                 self.phase = .active
                 await refreshProtectionStatus()
-                note = "已写入代理 127.0.0.1:\(upstream)（\(ClaudeRegions.displayName(for: exitCode)) · HTTP \(httpCode)\(localeSuffix)）。请重启 Claude Code。"
+                note = "已写入代理 127.0.0.1:\(String(upstream))（\(ClaudeRegions.displayName(for: exitCode)) · HTTP \(httpCode)\(localeSuffix)）。请重启 Claude Code。"
             }
         } catch {
             phase = .idle
@@ -490,7 +582,7 @@ final class ProtectionGuardEngine: ObservableObject {
         do {
             let upstream = savedUpstream ?? detectedPort ?? Clash.validPort(portOverride)
             guard let upstream else { throw ProtectionError.invalidPort }
-            let (httpCode, geo, latencyMs) = try await verifyCompliantUpstreamExit(port: upstream)
+            let (httpCode, geo, latencyMs, proto) = try await verifyCompliantUpstreamExit(port: upstream)
             let exitCode = geo.primaryCountryCode!
             let exitIP = geo.primaryIP!
 
@@ -498,6 +590,7 @@ final class ProtectionGuardEngine: ObservableObject {
             let boundPort = try await server.start(
                 preferredPort: savedGuardPort,
                 upstreamPort: upstream,
+                upstreamProtocol: proto,
                 initialState: .open(exitIP: exitIP, countryCode: exitCode)
             )
             guard boundPort == savedGuardPort else {
@@ -507,6 +600,7 @@ final class ProtectionGuardEngine: ObservableObject {
             self.proxy = server
             self.guardPort = boundPort
             self.upstreamPort = upstream
+            self.upstreamProtocol = proto
             self.pinnedCountry = exitCode
             self.pinnedIP = exitIP
             self.lastVerifiedCountry = exitCode
@@ -517,7 +611,7 @@ final class ProtectionGuardEngine: ObservableObject {
             self.lastNotifiedTripReason = nil
             await refreshProtectionStatus()
             startWatchdogAndObservers()
-            note = "已无缝接管守护端口 127.0.0.1:\(boundPort)（\(ClaudeRegions.displayName(for: exitCode)) · HTTP \(httpCode)）。"
+            note = "已无缝接管守护端口 127.0.0.1:\(String(boundPort))（\(ClaudeRegions.displayName(for: exitCode)) · HTTP \(httpCode)）。"
         } catch {
             phase = .idle
             issue = error.localizedDescription
@@ -577,13 +671,15 @@ final class ProtectionGuardEngine: ObservableObject {
         defer { verifying = false }
 
         let started = ContinuousClock.now
-        async let geoTask = ExitProbes.probeMultiSourceGeo(proxyPort: upstream)
+        let proto = upstreamProtocol
+        async let geoTask = ExitProbes.probeMultiSourceGeo(proxyPort: upstream, proxyProtocol: proto)
         async let apiReachableTask: Int? = {
             do {
                 let (_, resp) = try await Diagnostics.httpRequest(
                     URL(string: "https://api.anthropic.com/v1/models")!,
                     headers: ["anthropic-version": "2023-06-01"],
                     proxyPort: upstream,
+                    proxyProtocol: proto,
                     timeout: 5.5
                 )
                 return resp.statusCode
@@ -838,6 +934,7 @@ final class ProtectionGuardEngine: ObservableObject {
         if portOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             detectedPort = Clash.detectedPort()
                 ?? discoveredClients.first(where: { $0.protocols.supportsHTTP })?.port
+                ?? discoveredClients.first?.port
                 ?? clashSnapshot?.mixedPort
             guard let port = detectedPort else { throw ProtectionError.invalidPort }
             return port
@@ -846,10 +943,30 @@ final class ProtectionGuardEngine: ObservableObject {
         return port
     }
 
-    private func verifyCompliantUpstreamExit(port: Int) async throws -> (Int, MultiSourceGeoReport, Int) {
+    private func detectUpstreamProtocol(port: Int) async -> UpstreamProxyProtocol {
+        let support = await Task.detached(priority: .userInitiated) {
+            ProxyClientDiscovery.probePortProtocols(port: port)
+        }.value
+        return (support == .socks5Only) ? .socks5 : .httpConnect
+    }
+
+    private func verifyCompliantUpstreamExit(port: Int) async throws -> (Int, MultiSourceGeoReport, Int, UpstreamProxyProtocol) {
         let started = ContinuousClock.now
-        let httpCode = try await Task.detached(priority: .userInitiated) { try Clash.probe(port: port) }.value
-        let geo = await ExitProbes.probeMultiSourceGeo(proxyPort: port)
+        let proto = await detectUpstreamProtocol(port: port)
+        let httpCode: Int
+        if proto == .socks5 {
+            let (_, resp) = try await Diagnostics.httpRequest(
+                URL(string: "https://api.anthropic.com/v1/models")!,
+                headers: ["anthropic-version": "2023-06-01"],
+                proxyPort: port,
+                proxyProtocol: .socks5,
+                timeout: 6
+            )
+            httpCode = resp.statusCode
+        } else {
+            httpCode = try await Task.detached(priority: .userInitiated) { try Clash.probe(port: port) }.value
+        }
+        let geo = await ExitProbes.probeMultiSourceGeo(proxyPort: port, proxyProtocol: proto)
         let latencyMs = elapsedMilliseconds(since: started)
 
         guard geo.primaryIP != nil, let code = geo.primaryCountryCode else {
@@ -861,7 +978,7 @@ final class ProtectionGuardEngine: ObservableObject {
         guard ClaudeRegions.support(for: code) == .supported else {
             throw ProtectionError.unsupportedExitRegion(ClaudeRegions.displayName(for: code))
         }
-        return (httpCode, geo, latencyMs)
+        return (httpCode, geo, latencyMs, proto)
     }
 
     private func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Int {

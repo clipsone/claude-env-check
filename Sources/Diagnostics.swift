@@ -36,6 +36,7 @@ enum ReadingID: String, Codable, CaseIterable, Identifiable, Sendable {
     case egressRegion
     case geoConsensus
     case exitQuality
+    case ipReputation
     case ipv6Leak
     case exitDrift
     // DNS 与代理链路
@@ -58,7 +59,7 @@ enum ReadingID: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var category: ReadingCategory {
         switch self {
-        case .api, .claudeWeb, .egressRegion, .geoConsensus, .exitQuality, .ipv6Leak, .exitDrift:
+        case .api, .claudeWeb, .egressRegion, .geoConsensus, .exitQuality, .ipReputation, .ipv6Leak, .exitDrift:
             .egressCompliance
         case .dnsLeak, .tunCapture, .proxy, .dns:
             .networkLink
@@ -80,6 +81,7 @@ enum ReadingID: String, Codable, CaseIterable, Identifiable, Sendable {
         case .egressRegion: "公网出口与地区合规"
         case .geoConsensus: "多源 GeoIP 交叉核验"
         case .exitQuality: "出口网络属性"
+        case .ipReputation: "IP 纯净度与黑名单"
         case .ipv6Leak: "IPv6 双栈防泄漏"
         case .exitDrift: "48h 出口稳定性"
         case .dnsLeak: "真实 DNS 递归出口"
@@ -104,6 +106,7 @@ enum ReadingID: String, Codable, CaseIterable, Identifiable, Sendable {
         case .egressRegion: "Anthropic 185 国支持清单 · 出口归属核验"
         case .geoConsensus: "ipwho.is / ipinfo.io(ip.sb) / Cloudflare Trace"
         case .exitQuality: "统一 ASN 与运营商组织推断（非官方风控）"
+        case .ipReputation: "Spamhaus ZEN/DROP · Tor · DroneBL · UCEPROTECT 多源投票"
         case .ipv6Leak: "api4/api6.ipify.org · 双栈绕过检测"
         case .exitDrift: "本机 48 小时采样历史 · 跨国/换 IP 追踪"
         case .dnsLeak: "whoami.ds.akahelp.net + o-o.myaddr.l.google.com · mDNSResponder"
@@ -267,7 +270,7 @@ struct Snapshot: Codable, Sendable {
     func markdownReport() -> String {
         let verdict = self.verdict
         var lines: [String] = []
-        lines.append("# Claude 环境体检报告 (v1.1.2)")
+        lines.append("# Claude 环境体检报告 (v1.2.0)")
         lines.append("")
         lines.append("- 采样时间：\(capturedAt.formatted(date: .numeric, time: .standard))")
         lines.append("- 检测模式：\(online ? "联网实测" : "仅本机检查")（\(probeRouteDescription)）")
@@ -346,6 +349,11 @@ enum Diagnostics {
         let geoReport = await geoTask
         let dualStackReport = await dualStackTask
         let dnsProbeReport = await dnsProbeTask
+        let reputationReport: IPReputationReport? = if online, let ip = geoReport?.primaryIP {
+            await IPReputationProber.probe(ip: ip, geo: geoReport)
+        } else {
+            nil
+        }
 
         // Update 48h exit history when online scan observed a valid IP
         let driftSummary: ExitDriftSummary
@@ -378,6 +386,7 @@ enum Diagnostics {
             .egressRegion: buildEgressRegionReading(geo: geoReport),
             .geoConsensus: buildGeoConsensusReading(geo: geoReport),
             .exitQuality: buildExitQualityReading(geo: geoReport),
+            .ipReputation: buildIPReputationReading(report: reputationReport, online: online),
             .ipv6Leak: buildIPv6Reading(dualStack: dualStackReport, geo: geoReport),
             .exitDrift: buildExitDriftReading(summary: driftSummary),
             .dnsLeak: buildDNSLeakReading(probe: dnsProbeReport, geo: geoReport, route: route),
@@ -487,6 +496,15 @@ enum Diagnostics {
             return Reading(geo.networkKind.label, .response, severity: .neutral,
                            detail: meta.isEmpty ? "GeoIP 源未返回 ASN/组织信息" : "\(meta) · 不猜测住宅或机房")
         }
+    }
+
+    static func buildIPReputationReading(report: IPReputationReport?, online: Bool) -> Reading {
+        guard online else { return .pending }
+        guard let report else {
+            return Reading("无 IPv4 出口可检", .unavailable, severity: .neutral,
+                           detail: "联网测得 IPv4 出口后将自动进行多源黑名单与 Tor 库交叉投票")
+        }
+        return Reading(report.headline, .response, severity: report.severity, detail: report.detail)
     }
 
     private static func buildIPv6Reading(dualStack: DualStackReport?, geo: MultiSourceGeoReport?) -> Reading {
@@ -769,6 +787,15 @@ enum Diagnostics {
                 guidance: "不同 GeoIP 站点看到了不同国家出口，请检查 Clash 分流规则，确保 Anthropic / Cloudflare / 常见探测域名统一走同一固定节点。"
             ))
         }
+        let rep = snapshot.reading(.ipReputation)
+        if rep.severity == .danger {
+            actions.append(.init(
+                id: "ip-reputation",
+                severity: .danger,
+                title: "更换命中权威黑名单 / Tor 库的节点",
+                guidance: rep.detail ?? "当前出口 IP 被多个权威黑名单或 Tor 出口库标记，建议更换更纯净的固定节点。"
+            ))
+        }
         let ipv6 = snapshot.reading(.ipv6Leak)
         if ipv6.severity == .danger {
             actions.append(.init(
@@ -1025,6 +1052,7 @@ enum Diagnostics {
         method: String = "GET",
         headers: [String: String] = [:],
         proxyPort: Int? = nil,
+        proxyProtocol: UpstreamProxyProtocol = .httpConnect,
         timeout: TimeInterval = 7
     ) async throws -> (Data, HTTPURLResponse) {
         let config = URLSessionConfiguration.ephemeral
@@ -1035,14 +1063,23 @@ enum Diagnostics {
         config.urlCredentialStorage = nil
         config.urlCache = nil
         if let proxyPort {
-            config.connectionProxyDictionary = [
-                kCFNetworkProxiesHTTPEnable as String: 1,
-                kCFNetworkProxiesHTTPProxy as String: "127.0.0.1",
-                kCFNetworkProxiesHTTPPort as String: proxyPort,
-                kCFNetworkProxiesHTTPSEnable as String: 1,
-                kCFNetworkProxiesHTTPSProxy as String: "127.0.0.1",
-                kCFNetworkProxiesHTTPSPort as String: proxyPort,
-            ]
+            switch proxyProtocol {
+            case .httpConnect:
+                config.connectionProxyDictionary = [
+                    kCFNetworkProxiesHTTPEnable as String: 1,
+                    kCFNetworkProxiesHTTPProxy as String: "127.0.0.1",
+                    kCFNetworkProxiesHTTPPort as String: proxyPort,
+                    kCFNetworkProxiesHTTPSEnable as String: 1,
+                    kCFNetworkProxiesHTTPSProxy as String: "127.0.0.1",
+                    kCFNetworkProxiesHTTPSPort as String: proxyPort,
+                ]
+            case .socks5:
+                config.connectionProxyDictionary = [
+                    kCFNetworkProxiesSOCKSEnable as String: 1,
+                    kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+                    kCFNetworkProxiesSOCKSPort as String: proxyPort,
+                ]
+            }
         }
 
         let session = URLSession(configuration: config)

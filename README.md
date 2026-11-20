@@ -1,48 +1,56 @@
-# Claude 环境体检 (v1.1.2)
+# Claude 环境体检 (v1.2.0 · macOS + Windows 双平台)
 
-纯原生 Swift 6 / SwiftUI 实现的 Apple Silicon macOS **无 Root 本地熔断守卫 + Clash/Mihomo 深度共生 + Claude 全家桶工作台**（< 5 MB、零 Node.js、零 Root 守护进程、零全局时区篡改、与 Clash Verge / FlClash / Surge / 公司 VPN 100% 和平共生）。
+原生轻量级、零 Root / 零管理员权限的 **Claude 本地熔断守卫 + Clash/Mihomo 深度共生 + 多源 IP 黑名单投票 + 全家桶隔离工作台**：
 
-## 六大核心能力
+- **macOS 原生版（Apple Silicon macOS 13+）**：纯 Swift 6 / SwiftUI 原生应用（< 5 MB，零 Node.js，零 Root 守护进程，配备原生 Retina 应用图标）。
+- **Windows 原生版（Windows 10/11 amd64）**：纯 Go 零 CGO 静态单文件 `.exe`（零 DLL / 零 .NET / 零 Node 依赖，原生 Win32 系统托盘 + 本地加密令牌 Web 控制台，免 UAC 管理员权限）。
 
-1. **19 项零误报科学体检与综合合规判定**：
+## 核心能力（v1.2.0 全平台闭环）
+
+1. **20 项零误报科学体检与多源黑名单投票**：
    - Anthropic 官方 **185 国**支持清单校验（新加坡/台湾/英/德/法/加/日/美等全部零误报）；
    - 三源 GeoIP 交叉核验（`ipwho.is` + `ipinfo.io`/`api.ip.sb` + `Cloudflare Trace`）+ 统一 ASN 住宅/云机房推断；
-   - IPv4/IPv6 双栈防泄漏 + 原生 `mDNSResponder` 真实 DNS 递归出口与 ECS 网段泄漏实测 + Fake-IP TUN 探测；
-   - Claude Code 全链路配置审计（死代理端口、`NO_PROXY` 误放行、`settings.local.json` 与 `~/.zshrc` 冲突，绝不读 API Key）+ 识别进程级 `TZ` 对齐 + 一键复制脱敏 Markdown 报告。
-2. **纯 Swift 无 Root 本地熔断转发网关 & 菜单栏红绿灯常驻**：
-   - `Network.framework` 本地 `127.0.0.1:17899` 透明 HTTP `CONNECT` 转发器（零 MITM、拒绝回环 SSRF）；
-   - 后台 30s 巡检 + `NWPathMonitor` 网卡切换 + `NSWorkspace.didWakeNotification` 休眠唤醒 Fail-Closed；
-   - 出口漂移至不支持地区、多源分流冲突、上游掉线或触发「严格锁出口 IP」时，**毫秒级切断所有活跃隧道并拒绝新连接（HTTP 503）**，仅阻断 Claude，绝不影响其他软件或公司 VPN；
-   - 原生 `MenuBarExtra` 菜单栏常驻、关窗后台守护、退出同步恢复配置、异常强杀后支持一键无缝接管。
-3. **多代理客户端自动发现 & Clash/Mihomo 深度共生**：
-   - 独立双协议探测 HTTP CONNECT + SOCKS5，兼容 root Service Mode 内核（Clash Verge Rev / FlClash / Mihomo Party / ClashX / Surge / Stash / Hiddify / Sing-box）；
-   - 纯 Swift 直连 Clash/Mihomo External Controller（原生支持 **Unix Domain Socket + TCP**，密钥仅留内存），解析 `api.anthropic.com` 实际路由链路、预警 `URLTest`/`Fallback` 漂移组、实时监控 `/connections` 并一键切断违规直连；
-   - **懒人一键写入 Clash Verge 全局扩展脚本（`profiles/Script.js`）**：无需手动复制粘贴，一键原子备份并写入（已有自定义脚本自动串联保留、支持一键无损还原），自动置顶当前合规节点、创建 `Claude-Pin` 手动组、屏蔽 QUIC/STUN、代理远端 DoH 根治 DNS/ECS 泄漏；
-   - **2 秒本地节点变动秒级预熔断**：守卫运行中每 2 秒零外网流量轮询本地 Clash Unix Socket，一旦手动切节点立即先行熔断再复检出口，彻底堵死 30 秒切换空窗。
-4. **进程级 `TZ` / `LANG` 对齐注入（零全局系统污染）**：
-   - 按实测出口地区为 Claude Code、隔离浏览器和 Claude Desktop 单独注入进程级 `TZ`/`LANG`/`LC_ALL`，关闭防护时原子无损恢复，绝不改动 macOS 全局系统时区。
-5. **macOS Claude 全家桶安全工作台**：
-   - **隔离浏览器启动器**：以独立 `--user-data-dir` 启动本机 Chrome/Brave/Edge/Vivaldi，自动启用 `--disable-quic`、`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`、HTTP `CONNECT` 代理远端解析、进程级 `TZ` 与 `Accept-Language` 对齐（零 Chrome 提示横幅、绝不偷偷复制日常书签或 Cookie）；
-   - **Claude Desktop 专属对齐启动与安全清理**：支持同时锁定 Chromium 渲染层（`--proxy-server` + `--disable-quic`）与 Node 主进程代理，按项勾选缓存/Cookie/数据目录，严格防符号链接校验后**仅移入系统废纸篓**（绝不 `rm -rf`，绝不触碰 `~/.claude`）；
-   - **被动式 GitHub Releases 更新检查**：纯只读校验 SemVer，绝不自动下载或执行安装包。
-6. **48 小时连接审计日志 + 48 小时出口漂移追踪 + 多历史命名快照基线对比**：
-   - 支持最多 10 份命名快照自由对比、连接审计 CSV/JSON 导出、历史漂移分级预警与一键重置。
+   - **内置多源 IP 黑名单与纯净度投票**：并行实测 `Spamhaus ZEN / DROP`、`Tor 出口库`、`DroneBL`、`UCEPROTECT L1` 与 ASN 特征，精准过滤公共 DNS 限流码（`127.255.255.*`）与住宅动态段（PBL `127.0.0.10/.11`），坚持**多源共识、拒绝单源误报**；
+   - IPv4/IPv6 双栈防泄漏 + 真实 DNS 递归出口与 ECS 网段泄漏实测 + Fake-IP TUN 探测 + 进程级 `TZ` 对齐识别 + 48h 漂移分级预警与一键重置。
+2. **本地无 Root/无管理员熔断转发网关（支持 HTTP CONNECT & 纯 SOCKS5 上游）**：
+   - 仅监听 `127.0.0.1:17899`，透明转发（零 MITM、拒绝回环 SSRF `403`），**自动识别 HTTP CONNECT 与 RFC 1928 纯 SOCKS5 上游**（可把纯 SOCKS5 代理自动桥接给只认 HTTP 代理的 Claude Code）；
+   - 30 秒后台巡检 + **2 秒本地 Clash 节点切换秒级预熔断** + macOS 网卡变化与休眠唤醒 Fail-Closed，出口漂移或代理掉线时**毫秒级切断所有活跃隧道并返回 HTTP 503**，绝不影响其他应用或公司 VPN。
+3. **多代理客户端自动发现 & 一键防泄漏脚本**：
+   - 独立双协议探测 HTTP + SOCKS5，兼容 Clash Verge Rev / 旧版 Clash Verge / Mihomo Party / FlClash / Surge / Stash / v2rayN / Hiddify / Sing-box；
+   - 直连 Clash/Mihomo External Controller（macOS 原生支持 Unix Socket + TCP，Windows 支持 TCP）监控 `/connections` 并一键切断违规直连；
+   - **多客户端懒人一键写入防泄漏脚本**：支持 **Clash Verge Rev、旧版 Clash Verge、Mihomo Party、FlClash**，自动原子备份原脚本、IIFE 串联保留用户自定义逻辑、支持一键无损还原。
+4. **开机静默常驻与自动护卫**：
+   - macOS 使用原生 `SMAppService.mainApp` 登录项（免 Root），Windows 使用当前用户 `HKCU\...\Run`（免管理员），重启后静默驻留菜单栏/托盘并自动等待代理就绪拉起守卫。
+5. **终端防漏安全壳（`claude-safe`）**：
+   - 一键安装 `~/.local/bin/claude-safe`（macOS）或 `%USERPROFILE%\.local\bin\claude-safe.cmd`（Windows）；
+   - 每次启动 Claude Code 前 < 50ms 探测本地 `127.0.0.1:<port>/__claude_guard_health`（零外网流量），守卫离线或熔断时直接拦截并提示原因，彻底杜绝忘开守卫裸连。
+6. **Claude 全家桶安全工作台**：
+   - **隔离浏览器启动器**：以独立 `--user-data-dir` 启动本机 Chrome / Edge / Brave / Vivaldi，自动启用 `--disable-quic`、防 WebRTC 直连 UDP、`Accept-Language` 自动写入 `Default/Preferences` 与进程级 `TZ`（零 Chrome 不受支持标记横幅、绝不复制日常书签）；
+   - **Claude Desktop 对齐启动与安全清理**：同时锁定 Chromium 渲染层（`--proxy-server` + `--disable-quic`）与 Electron Node 主进程代理，macOS 版支持按项勾选并仅移入系统废纸篓（绝不触碰 `~/.claude`）；
+   - **48h 连接审计（CSV/JSON 导出）+ 48h 出口漂移历史 + 被动式 GitHub Releases 更新检查**。
 
 ## 下载安装
 
-直接前往 [Releases 页面](https://github.com/clipsone/claude-env-check/releases) 下载最新的 `Claude-Environment-Check-*-arm64.dmg`（适用于 Apple Silicon macOS 13+），拖入「应用程序」即可。
+前往 [GitHub Releases](https://github.com/clipsone/claude-env-check/releases) 下载对应平台安装包：
 
-> 注：未公证的本地签名应用首次打开时，如遇 macOS 提示，可在「访达 → 应用程序」中右键「Claude 环境体检」选择「打开」，或执行 `xattr -dr com.apple.quarantine "/Applications/Claude 环境体检.app"`。
+- **macOS (Apple Silicon, macOS 13+)**：下载 `Claude-Environment-Check-*-arm64.dmg`，拖入「应用程序」。
+  - 首次打开若遇本地签名提示，在「访达 → 应用程序」中右键选择「打开」，或运行 `xattr -dr com.apple.quarantine "/Applications/Claude 环境体检.app"`。
+- **Windows (Windows 10/11 64 位)**：下载 `Claude-Environment-Check-*-windows-amd64.exe`，双击直接运行（无需安装，无需管理员权限，自动打开本地控制台并在右下角系统托盘常驻）。
 
-## 本地测试、构建与打包
+## 本地测试与构建
 
+### macOS
 ```bash
-# 运行完整自动化测试套件（不污染本机配置，零网络依赖；加 --live 可追加实机冒烟）
+# 运行完整 Swift 6 自动化测试套件（零网络依赖、不污染本机配置）
 bash test.sh
 
-# 一键：运行测试 + Swift 6 严格编译 + 覆盖安装到 /Applications + 打包 arm64 DMG
+# 测试 + Swift 6 严格编译 + 覆盖安装到 /Applications + 打包 arm64 DMG
 bash build.sh --test --install --dmg
+```
 
-# 可选：使用 Apple Developer ID 签名与 Hardened Runtime
-bash build.sh --test --dmg --sign "Developer ID Application: Your Name (TEAMID)"
+### Windows (Go 1.22+，零第三方依赖)
+```bash
+cd windows
+go test -v ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../build/Claude-Environment-Check-1.2.0-windows-amd64.exe ./cmd/claude-env-check
 ```

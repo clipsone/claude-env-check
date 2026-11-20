@@ -75,6 +75,77 @@ final class MockUpstreamConnectServer: @unchecked Sendable {
     }
 }
 
+final class MockUpstreamSOCKS5Server: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "tests.mock-socks5")
+    private var listener: NWListener?
+
+    func start() async throws -> Int {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let l = try NWListener(using: params)
+        return try await withCheckedThrowingContinuation { cont in
+            let once = TestOnce()
+            l.stateUpdateHandler = { [weak self] st in
+                switch st {
+                case .ready:
+                    if once.claim() {
+                        self?.listener = l
+                        cont.resume(returning: Int(l.port!.rawValue))
+                    }
+                case .failed(let e):
+                    if once.claim() { cont.resume(throwing: e) }
+                default: break
+                }
+            }
+            l.newConnectionHandler = { conn in
+                conn.start(queue: self.queue)
+                conn.receive(minimumIncompleteLength: 3, maximumLength: 256) { data, _, _, _ in
+                    guard let data, data.count >= 3, data[0] == 0x05 else {
+                        conn.cancel()
+                        return
+                    }
+                    conn.send(content: Data([0x05, 0x00]), completion: .contentProcessed { _ in
+                        conn.receive(minimumIncompleteLength: 7, maximumLength: 512) { req, _, _, _ in
+                            guard let req, req.count >= 7, req[0] == 0x05, req[1] == 0x01 else {
+                                conn.cancel()
+                                return
+                            }
+                            let reply = Data([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xBB])
+                            conn.send(content: reply, completion: .contentProcessed { _ in
+                                Self.echoLoop(conn)
+                            })
+                        }
+                    })
+                }
+            }
+            l.start(queue: queue)
+        }
+    }
+
+    private static func echoLoop(_ conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, isComplete, err in
+            if let data, !data.isEmpty {
+                var resp = Data("socks5-echo:".utf8)
+                resp.append(data)
+                conn.send(content: resp, completion: .contentProcessed { sendErr in
+                    if sendErr != nil || isComplete || err != nil {
+                        conn.cancel()
+                    } else {
+                        echoLoop(conn)
+                    }
+                })
+            } else {
+                conn.cancel()
+            }
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+    }
+}
+
 func sendRawTCP(port: Int, payload: String, followUp: String? = nil) async throws -> (first: String, second: String?) {
     let conn = NWConnection(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: UInt16(port))!, using: .tcp)
     let q = DispatchQueue(label: "tests.client.\(UUID().uuidString)")
@@ -145,8 +216,9 @@ struct RunAllTests {
         await testPhase3ClashSymbiosisAndLocale(tmpRoot: tmpRoot)
         testPhase4WorkbenchAndUpdateChecker(tmpRoot: tmpRoot)
         testPhase4LazyVergeScriptInstaller(tmpRoot: tmpRoot)
+        await testV120Features(tmpRoot: tmpRoot)
 
-        print("PASS: All \(passedCount) assertions succeeded across Phases 1–4 + v1.1!")
+        print("PASS: All \(passedCount) assertions succeeded across Phases 1–4 + v1.2.0!")
 
         if liveMode {
             await runLiveSmokeChecks(tmpRoot: tmpRoot)
@@ -531,6 +603,123 @@ struct RunAllTests {
             rejected = true
         }
         check(rejected, "Symlink Script.js MUST be rejected")
+    }
+
+    // MARK: - v1.2.0 Tests (IP Reputation, SOCKS5 Upstream, Health Endpoint, Multi-Client Scripts, claude-safe, LoginItem)
+
+    static func testV120Features(tmpRoot: URL) async {
+        // 1. Multi-source IP reputation voting (zero false positive on Spamhaus query-refused & PBL!)
+        check(IPReputationProber.reverseIPv4("48.45.153.58") == "58.153.45.48", "Reverse IPv4 octets")
+        check(IPReputationProber.reverseIPv4("2606:4700::1") == nil, "Reject IPv6 in IPv4 reverser")
+
+        let refused = IPReputationProber.classifySpamhausZen(returnIPs: ["127.255.255.254"])
+        check(refused.outcome == .unavailable, "Spamhaus public-resolver refusal 127.255.255.254 MUST be unavailable, never a hit")
+
+        let pbl = IPReputationProber.classifySpamhausZen(returnIPs: ["127.0.0.10"])
+        check(pbl.outcome == .clean && pbl.category == .residentialPBL, "Spamhaus PBL 127.0.0.10 MUST be treated as clean residential")
+
+        let sbl = IPReputationProber.classifySpamhausZen(returnIPs: ["127.0.0.2"])
+        check(sbl.outcome == .flagged, "Spamhaus SBL 127.0.0.2 must be flagged")
+
+        let singleHitReport = IPReputationProber.synthesize(ip: "1.2.3.4", votes: [
+            IPReputationProber.classifySpamhausZen(returnIPs: []),
+            IPReputationProber.classifySpamhausDrop(returnIPs: []),
+            IPReputationProber.classifyTorExit(returnIPs: []),
+            IPReputationProber.classifyDroneBL(returnIPs: []),
+            IPReputationProber.classifyUCEProtect(returnIPs: ["127.0.0.2"]),
+        ])
+        check(singleHitReport.severity == .caution && singleHitReport.blacklistHits == 1, "Single non-Spamhaus hit must be caution (multi-source consensus)")
+
+        let torReport = IPReputationProber.synthesize(ip: "1.2.3.4", votes: [
+            IPReputationProber.classifySpamhausZen(returnIPs: []),
+            IPReputationProber.classifyTorExit(returnIPs: ["127.0.0.2"]),
+        ])
+        check(torReport.severity == .danger && torReport.isTorExit, "Tor exit node must be danger")
+
+        let cleanReport = IPReputationProber.synthesize(ip: "48.45.153.58", votes: [
+            IPReputationProber.classifySpamhausZen(returnIPs: []),
+            IPReputationProber.classifySpamhausDrop(returnIPs: []),
+            IPReputationProber.classifyTorExit(returnIPs: []),
+            IPReputationProber.classifyDroneBL(returnIPs: []),
+            IPReputationProber.classifyUCEProtect(returnIPs: []),
+        ])
+        check(cleanReport.severity == .ok && cleanReport.blacklistHits == 0 && cleanReport.blacklistChecked == 5, "Clean IP must be ok")
+
+        // 2. Pure Swift SOCKS5 upstream + /__claude_guard_health endpoint
+        let pkt = CircuitBreakerProxy.buildSOCKS5ConnectPacket(host: "api.anthropic.com", port: 443)
+        check(pkt != nil && pkt![0] == 0x05 && pkt![1] == 0x01 && pkt![3] == 0x03, "RFC 1928 domain CONNECT packet")
+
+        let socksServer = MockUpstreamSOCKS5Server()
+        do {
+            let socksPort = try await socksServer.start()
+            defer { socksServer.stop() }
+            let breaker = CircuitBreakerProxy(onAudit: { _ in })
+            let guardPort = try await breaker.start(
+                preferredPort: 17919,
+                upstreamPort: socksPort,
+                upstreamProtocol: .socks5,
+                initialState: .open(exitIP: "48.45.153.58", countryCode: "US")
+            )
+            defer { breaker.stop() }
+
+            let healthOpen = try await sendRawTCP(
+                port: guardPort,
+                payload: "GET /__claude_guard_health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            check(healthOpen.first.hasPrefix("HTTP/1.1 200") && healthOpen.first.contains("\"state\":\"open\"") && healthOpen.first.contains("\"upstreamProtocol\":\"socks5\""), "Health endpoint reports open SOCKS5 guard")
+
+            let tunnel = try await sendRawTCP(
+                port: guardPort,
+                payload: "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n",
+                followUp: "hello-socks5"
+            )
+            check(tunnel.first.hasPrefix("HTTP/1.1 200"), "CONNECT via SOCKS5 upstream returns 200")
+            check(tunnel.second == "socks5-echo:hello-socks5", "Bidirectional relay through SOCKS5 upstream succeeds")
+
+            breaker.setGateState(.tripped(reason: "Node switched"))
+            let healthTripped = try await sendRawTCP(
+                port: guardPort,
+                payload: "GET /__claude_guard_health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            check(healthTripped.first.hasPrefix("HTTP/1.1 503") && healthTripped.first.contains("\"state\":\"tripped\""), "Health endpoint reports 503 when tripped")
+        } catch {
+            check(false, "SOCKS5 breaker integration failed: \(error)")
+        }
+
+        // 3. Multi-client override script installer (Mihomo Party + FlClash)
+        let mcHome = tmpRoot.appendingPathComponent("mc-home", isDirectory: true)
+        let mcState = tmpRoot.appendingPathComponent("mc-state", isDirectory: true)
+        try! FileManager.default.createDirectory(at: ProxyScriptTarget.mihomoParty.configDirURL(home: mcHome), withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: ProxyScriptTarget.flClash.configDirURL(home: mcHome), withIntermediateDirectories: true)
+        let targets = ClashVergeScriptInstaller.discoverInstalledTargets(home: mcHome)
+        check(targets.contains(.mihomoParty) && targets.contains(.flClash), "Discover Mihomo Party & FlClash")
+        _ = try! ClashVergeScriptInstaller.install(target: .mihomoParty, preferredNodeName: "US-01", home: mcHome, stateDirectory: mcState)
+        check(ClashVergeScriptInstaller.inspectStatus(target: .mihomoParty, home: mcHome, stateDirectory: mcState) == .installed(chainedCustomScript: false, activeInKernel: false), "Mihomo Party script installed")
+        try! ClashVergeScriptInstaller.restore(target: .mihomoParty, home: mcHome, stateDirectory: mcState)
+        check(!FileManager.default.fileExists(atPath: ProxyScriptTarget.mihomoParty.scriptURL(home: mcHome).path), "Mihomo Party standalone override removed cleanly on restore")
+
+        // 4. Terminal anti-leak wrapper (claude-safe) install / foreign check / uninstall
+        let shHome = tmpRoot.appendingPathComponent("sh-home", isDirectory: true)
+        try! FileManager.default.createDirectory(at: shHome, withIntermediateDirectories: true)
+        check(TerminalShellGuard.inspectStatus(home: shHome) == .notInstalled, "Initially claude-safe not installed")
+        let installedURL = try! TerminalShellGuard.install(home: shHome)
+        let installedText = try! String(contentsOf: installedURL, encoding: .utf8)
+        check(installedText.contains(TerminalShellGuard.managedMarker) && installedText.contains("__claude_guard_health"), "claude-safe contains marker and health check")
+        check(FileManager.default.isExecutableFile(atPath: installedURL.path), "claude-safe must be executable")
+        if case .installed = TerminalShellGuard.inspectStatus(home: shHome) {
+            check(true, "claude-safe status installed")
+        } else {
+            check(false, "Expected installed status for claude-safe")
+        }
+        try! TerminalShellGuard.uninstall(home: shHome)
+        check(TerminalShellGuard.inspectStatus(home: shHome) == .notInstalled, "claude-safe cleanly uninstalled")
+
+        // 5. LoginItemManager safe behavior outside .app bundle
+        if case .unavailable = LoginItemManager.currentState() {
+            check(true, "LoginItemManager safely reports unavailable outside .app bundle")
+        } else {
+            check(false, "Expected unavailable login item state in CLI test runner")
+        }
     }
 
     // MARK: - Optional Live Smoke Checks (--live)

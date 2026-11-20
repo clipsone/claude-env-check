@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Claude 环境体检 v1.2.0 (Windows)</title>
+<style>
+  :root {
+    --bg: #f5f7f8; --card: #ffffff; --fg: #111827; --muted: #6b7280;
+    --border: #e5e7eb; --teal: #0d9488; --orange: #d97706; --red: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1419; --card: #182026; --fg: #f3f4f6; --muted: #9ca3af; --border: #2b3540; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--fg); }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 20px 24px 40px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 42px; height: 42px; border-radius: 10px; background: linear-gradient(135deg,#083344,#0d9488,#2dd4bf); display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 18px; }
+  h1 { margin: 0; font-size: 22px; display: flex; align-items: center; gap: 8px; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: rgba(13,148,136,.15); color: var(--teal); font-weight: 600; }
+  .sub { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--fg); padding: 7px 13px; border-radius: 8px; font-size: 13px; font-weight: 500; }
+  button:hover { border-color: var(--teal); }
+  button.primary { background: var(--teal); color: #fff; border-color: var(--teal); }
+  button.danger { background: var(--red); color: #fff; border-color: var(--red); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .tabs { display: flex; gap: 6px; margin: 16px 0; flex-wrap: wrap; }
+  .tab { padding: 7px 14px; border-radius: 8px; background: transparent; border: 1px solid transparent; }
+  .tab.active { background: var(--card); border-color: var(--border); color: var(--teal); font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .banner { border-radius: 12px; padding: 16px; margin-bottom: 14px; border: 1px solid var(--border); }
+  .banner.healthy { background: rgba(13,148,136,.09); border-color: rgba(13,148,136,.35); }
+  .banner.caution { background: rgba(217,119,6,.09); border-color: rgba(217,119,6,.35); }
+  .banner.risk { background: rgba(220,38,38,.09); border-color: rgba(220,38,38,.35); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(310px,1fr)); gap: 14px; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--border); }
+  .row:first-child { border-top: none; padding-top: 0; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .ok { color: var(--teal); } .caution { color: var(--orange); } .danger { color: var(--red); } .muted { color: var(--muted); }
+  input[type=text], input[type=number], select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; font-size: 13px; }
+  label.chk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.ok { background: rgba(13,148,136,.15); } .pill.danger { background: rgba(220,38,38,.15); } .pill.caution { background: rgba(217,119,6,.15); }
+  .note { margin-top: 8px; font-size: 13px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo">⚡</div>
+      <div>
+        <h1>Claude 环境体检 <span class="badge">v1.2.0 · Windows 零管理员</span></h1>
+        <p class="sub">无管理员本地熔断守卫（HTTP &amp; SOCKS5）· Clash/Mihomo 深度共生 · 多源黑名单投票 · 隔离工作台</p>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button onclick="scan(false)">本机检测</button>
+      <button class="primary" onclick="scan(true)">联网检测</button>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="readings" onclick="switchTab('readings')">检测结果</button>
+    <button class="tab" data-tab="symbiosis" onclick="switchTab('symbiosis')">代理共生与一键脚本</button>
+    <button class="tab" data-tab="workbench" onclick="switchTab('workbench')">工作台与安全壳</button>
+    <button class="tab" data-tab="audit" onclick="switchTab('audit')">连接审计</button>
+    <button class="tab" data-tab="history" onclick="switchTab('history')">48h 出口历史</button>
+  </div>
+
+  <div id="tab-readings">
+    <div id="verdictBox" class="banner">加载中…</div>
+    <div id="guardCard" class="card"></div>
+    <div id="readingsGrid" class="grid"></div>
+  </div>
+
+  <div id="tab-symbiosis" class="hidden">
+    <div id="clientsCard" class="card"></div>
+    <div id="controllerCard" class="card"></div>
+    <div id="scriptsCard" class="card"></div>
+  </div>
+
+  <div id="tab-workbench" class="hidden">
+    <div id="browserCard" class="card"></div>
+    <div id="desktopCard" class="card"></div>
+    <div id="shellCard" class="card"></div>
+    <div id="startupCard" class="card"></div>
+  </div>
+
+  <div id="tab-audit" class="hidden">
+    <div id="auditCard" class="card"></div>
+  </div>
+
+  <div id="tab-history" class="hidden">
+    <div id="historyCard" class="card"></div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "__GUARD_TOKEN__";
+let state = {};
+
+async function api(path, method = "GET", body = null) {
+  const opts = { method, headers: { "X-Guard-Token": TOKEN } };
+  if (body !== null) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function switchTab(name) {
+  for (const id of ["readings", "symbiosis", "workbench", "audit", "history"]) {
+    document.getElementById("tab-" + id).classList.toggle("hidden", id !== name);
+  }
+  document.querySelectorAll(".tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+}
+
+async function refresh() {
+  state = await api("/api/state");
+  render();
+}
+
+async function scan(online) {
+  document.getElementById("verdictBox").innerHTML = online ? "正在执行联网检测（三源 GeoIP + 黑名单投票 + DNS/ECS + API）…" : "正在读取本机配置…";
+  await api("/api/scan", "POST", { online });
+  await refresh();
+}
+
+async function startGuard() {
+  const port = parseInt(document.getElementById("upPort")?.value || "0", 10);
+  const injectLocale = document.getElementById("chkLocale")?.checked ?? true;
+  const strictIP = document.getElementById("chkStrictIP")?.checked ?? false;
+  try { await api("/api/guard/start", "POST", { upstreamPort: port, injectLocale, strictIPLock: strictIP }); }
+  catch (e) { alert(e.message); }
+  await refresh();
+}
+
+async function stopGuard() { await api("/api/guard/stop", "POST"); await refresh(); }
+async function recheckGuard(acceptNewIP = false) { await api("/api/guard/recheck", "POST", { acceptNewIP }); await refresh(); }
+async function tripGuard() { await api("/api/guard/trip", "POST"); await refresh(); }
+async function refreshSymbiosis() { await api("/api/symbiosis/refresh", "POST"); await refresh(); }
+async function installScript(id) {
+  try { const r = await api("/api/script/install", "POST", { targetID: id }); alert(r.message); }
+  catch (e) { alert(e.message); }
+  await refresh();
+}
+async function restoreScript(id) {
+  if (!confirm("确认无损还原该客户端原始脚本？")) return;
+  try { const r = await api("/api/script/restore", "POST", { targetID: id }); alert(r.message); }
+  catch (e) { alert(e.message); }
+  await refresh();
+}
+async function closeClashConn(id) { await api("/api/clash/close", "POST", { id }); await refresh(); }
+async function launchBrowser() {
+  const browserID = document.getElementById("selBrowser")?.value || "";
+  const startURL = document.getElementById("txtURL")?.value || "https://claude.ai";
+  try { const r = await api("/api/workbench/browser", "POST", { browserID, startURL }); alert(r.message); }
+  catch (e) { alert(e.message); }
+}
+async function launchDesktop(isolated) {
+  try { const r = await api("/api/workbench/desktop", "POST", { isolated }); alert(r.message); }
+  catch (e) { alert(e.message); }
+}
+async function toggleShell(install) {
+  try { const r = await api("/api/workbench/shell", "POST", { install }); alert(r.message); }
+  catch (e) { alert(e.message); }
+  await refresh();
+}
+async function toggleAutoStart(enabled) {
+  try { await api("/api/workbench/autostart", "POST", { enabled }); }
+  catch (e) { alert(e.message); }
+  await refresh();
+}
+async function clearHistory() { await api("/api/history/clear", "POST"); await refresh(); }
+async function clearAudit() { await api("/api/audit/clear", "POST"); await refresh(); }
+
+function render() {
+  const snap = state.snapshot;
+  const g = state.guard || {};
+
+  // Verdict
+  if (snap && snap.verdict) {
+    const v = snap.verdict;
+    const cls = v.level === "healthy" ? "healthy" : (v.level === "risk" ? "risk" : "caution");
+    const acts = (v.actions || []).map(a => `
+      <div class="row">
+        <div><strong class="${esc(a.severity)}">${esc(a.title)}</strong><div class="sub">${esc(a.guidance)}</div></div>
+        ${a.id === "drift" ? `<button onclick="clearHistory()">确认已固定，清空 48h 记录</button>` : ""}
+      </div>`).join("");
+    document.getElementById("verdictBox").className = "banner " + cls;
+    document.getElementById("verdictBox").innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <div><strong>${esc(v.headline)}</strong><div class="sub">${esc(v.summary)}</div></div>
+        <div class="btn-row">
+          <span class="pill ok">通过 ${v.okCount}</span>
+          ${v.cautionCount ? `<span class="pill caution">注意 ${v.cautionCount}</span>` : ""}
+          ${v.dangerCount ? `<span class="pill danger">高危 ${v.dangerCount}</span>` : ""}
+        </div>
+      </div>
+      ${acts ? `<div style="margin-top:10px">${acts}</div>` : ""}`;
+  }
+
+  // Guard card
+  const running = g.running;
+  const tripped = g.tripped;
+  document.getElementById("guardCard").innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+      <div>
+        <strong>本地无管理员熔断守卫（HTTP &amp; SOCKS5 上游自动桥接）</strong>
+        ${running ? `<span class="pill ${tripped ? "danger" : "ok"}">${tripped ? "已熔断阻断" : "护卫中 · 活跃隧道 " + (g.activeTunnels || 0)}</span>` : ""}
+        ${g.processTZ ? `<span class="pill ok">进程 TZ=${esc(g.processTZ)}</span>` : ""}
+        <div class="sub">仅在 127.0.0.1 建透明熔断口，漂移至不支持地区或切换节点时毫秒级切断 Claude，绝不修改 Windows 全局时区。</div>
+      </div>
+      <div class="btn-row">
+        ${running ? `
+          <button onclick="recheckGuard(false)">立即复检</button>
+          ${tripped ? `<button class="primary" onclick="recheckGuard(true)">接受新出口并解除</button>` : `<button onclick="tripGuard()">手动熔断</button>`}
+          <button class="danger" onclick="stopGuard()">关闭并恢复</button>
+        ` : `
+          <span class="mono muted">127.0.0.1:</span>
+          <input id="upPort" type="number" style="width:90px" value="${esc(g.upstreamPort || g.detectedPort || 7897)}" />
+          <label class="chk"><input id="chkLocale" type="checkbox" ${g.injectLocale !== false ? "checked" : ""} />进程 TZ/LANG</label>
+          <label class="chk"><input id="chkStrictIP" type="checkbox" ${g.strictIPLock ? "checked" : ""} />锁固定 IP</label>
+          <button class="primary" onclick="startGuard()">启动熔断守卫</button>
+        `}
+      </div>
+    </div>
+    ${running ? `<div class="note mono muted">127.0.0.1:${g.guardPort} → ${g.upstreamProtocol === "socks5" ? "SOCKS5 " : ""}:${g.upstreamPort} · 出口 ${esc(g.lastVerifiedIP)} (${esc(g.lastVerifiedCountry)})</div>` : ""}
+    ${g.note ? `<div class="note ok">${esc(g.note)}</div>` : ""}
+    ${g.error ? `<div class="note danger">${esc(g.error)}</div>` : ""}`;
+
+  // Readings
+  const groups = { egress: [], network: [], claude: [], local: [] };
+  (snap?.readings || []).forEach(r => (groups[r.category] || groups.local).push(r));
+  const titles = { egress: "出口合规、黑名单投票与稳定性", network: "DNS 与代理链路", claude: "Claude 客户端配置", local: "本机环境" };
+  document.getElementById("readingsGrid").innerHTML = Object.entries(groups).map(([k, list]) => `
+    <div class="card">
+      <h3 style="margin:0 0 10px;font-size:15px">${titles[k]}</h3>
+      ${list.map(r => `
+        <div class="row">
+          <div>
+            <div class="muted" style="font-size:12px">${esc(r.title)}</div>
+            <div class="mono ${esc(r.severity)}" style="font-weight:600">${esc(r.value)}</div>
+            ${r.detail ? `<div class="sub">${esc(r.detail)}</div>` : ""}
+          </div>
+        </div>`).join("")}
+    </div>`).join("");
+
+  // Symbiosis
+  const clients = state.clients || [];
+  document.getElementById("clientsCard").innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <strong>发现的本机代理客户端（HTTP &amp; SOCKS5 独立探测）</strong>
+      <button onclick="refreshSymbiosis()">刷新扫描</button>
+    </div>
+    ${clients.length ? clients.map(c => `
+      <div class="row">
+        <div><strong>${esc(c.clientName)}</strong> <span class="pill ok">${esc(c.label)}</span></div>
+        <div class="mono">127.0.0.1:${c.port}</div>
+      </div>`).join("") : `<div class="sub">暂未发现监听中的代理端口。</div>`}`;
+
+  const cs = state.clash;
+  document.getElementById("controllerCard").innerHTML = cs ? `
+    <strong>Clash / Mihomo 控制器（${esc(cs.clientName)} · ${esc(cs.kernelVersion)}）</strong>
+    <div class="sub">模式 ${esc(cs.mode)} · TUN ${cs.tunEnabled ? "开启" : "关闭"} · 命中规则 ${esc(cs.matchedRule)} · 链路：<span class="mono">${esc((cs.routeChain || []).join(" → "))}</span></div>
+    ${cs.isDirect ? `<div class="note danger">高危：Claude 流量当前命中 DIRECT 直连！</div>` : ""}
+    ${cs.hasDynamicGroup ? `<div class="note caution">漂移警告：经过动态切组 ${esc((cs.dynamicGroups || []).join("、"))}</div>` : ""}
+    <div style="margin-top:10px"><strong>实时 Claude 连接 (${(cs.claudeConnections || []).length} / 全局 ${cs.totalConnections})</strong></div>
+    ${(cs.claudeConnections || []).map(c => `
+      <div class="row">
+        <div class="mono ${c.isViolation ? "danger" : ""}">${esc(c.host)}:${esc(c.port)} · ${esc((c.chains || []).slice().reverse().join(" → "))}</div>
+        <button onclick="closeClashConn('${esc(c.id)}')">断开</button>
+      </div>`).join("") || `<div class="sub">暂无活跃 Claude 连接。</div>`}`
+    : `<strong>Clash / Mihomo 控制器</strong><div class="sub">未检测到 External Controller（默认探测配置文件与 9097/9090）。</div>`;
+
+  const targets = state.scriptTargets || [];
+  document.getElementById("scriptsCard").innerHTML = `
+    <strong>多客户端一键防泄漏扩展脚本（原子备份 · 保留原脚本 · 一键还原）</strong>
+    <div class="sub">支持 Clash Verge Rev / 旧版 Clash Verge / Mihomo Party / FlClash</div>
+    ${targets.map(t => `
+      <div class="row">
+        <div>
+          <strong>${esc(t.displayName)}</strong>
+          ${!t.installed ? `<span class="muted">（未检测到目录）</span>` : (t.scriptActive ? `<span class="pill ok">已写入${t.chainedCustom ? " · 已串联原脚本" : ""}</span>` : `<span class="pill caution">未写入</span>`)}
+          <div class="sub mono">${esc(t.scriptPath)}</div>
+        </div>
+        <div class="btn-row">
+          <button class="primary" ${t.installed ? "" : "disabled"} onclick="installScript('${esc(t.id)}')">${t.scriptActive ? "更新脚本" : "一键写入"}</button>
+          ${t.scriptActive ? `<button onclick="restoreScript('${esc(t.id)}')">一键还原</button>` : ""}
+        </div>
+      </div>`).join("")}`;
+
+  // Workbench
+  const browsers = state.browsers || [];
+  document.getElementById("browserCard").innerHTML = `
+    <strong>隔离浏览器工作台（Web 版 claude.ai）</strong>
+    <div class="sub">独立 --user-data-dir、禁 QUIC、防 WebRTC 直连 UDP、HTTP 代理、自动写 Accept-Language 与进程 TZ，不弹 Chrome 提示横幅，绝不复制书签。</div>
+    <div class="btn-row" style="margin-top:10px">
+      <select id="selBrowser">${browsers.map(b => `<option value="${esc(b.id)}">${esc(b.name)}</option>`).join("") || `<option value="">未检测到 Chromium 浏览器</option>`}</select>
+      <input id="txtURL" type="text" value="https://claude.ai" style="width:240px" />
+      <button class="primary" ${browsers.length ? "" : "disabled"} onclick="launchBrowser()">启动隔离浏览器</button>
+    </div>`;
+
+  document.getElementById("desktopCard").innerHTML = `
+    <strong>Claude Desktop（Windows 对齐启动）</strong>
+    <div class="sub">同时锁死 Chromium 渲染层（--proxy-server + --disable-quic）与 Electron Node 主进程代理，并注入进程级 TZ/LANG。</div>
+    <div class="btn-row" style="margin-top:10px">
+      <span class="mono muted">${esc(state.desktopExe || "未检测到 Claude Desktop")}</span>
+      <button class="primary" ${state.desktopExe ? "" : "disabled"} onclick="launchDesktop(false)">对齐环境启动</button>
+      <button ${state.desktopExe ? "" : "disabled"} onclick="launchDesktop(true)">独立 Profile 启动</button>
+    </div>`;
+
+  document.getElementById("shellCard").innerHTML = `
+    <strong>终端防漏安全壳（claude-safe.cmd）</strong>
+    <div class="sub">启动 Claude Code 前 50ms 本地核验 127.0.0.1 熔断守卫健康接口，防止忘开守卫裸连出去。</div>
+    <div class="btn-row" style="margin-top:10px">
+      <span class="pill ${state.shellGuardInstalled ? "ok" : "caution"}">${state.shellGuardInstalled ? "已安装 (~/.local/bin/claude-safe.cmd)" : "未安装"}</span>
+      <button class="primary" onclick="toggleShell(true)">${state.shellGuardInstalled ? "更新安全壳" : "一键安装 claude-safe"}</button>
+      ${state.shellGuardInstalled ? `<button onclick="toggleShell(false)">卸载</button>` : ""}
+    </div>`;
+
+  document.getElementById("startupCard").innerHTML = `
+    <strong>Windows 开机静默驻留托盘（HKCU Run · 零管理员）</strong>
+    <div class="sub">写入当前用户注册表 Run 项，登录 Windows 后静默常驻右下角托盘并自动等待代理就绪后开启守卫。</div>
+    <div class="btn-row" style="margin-top:10px">
+      <label class="chk"><input type="checkbox" ${state.autoStart ? "checked" : ""} onchange="toggleAutoStart(this.checked)" />开机静默自启</label>
+    </div>`;
+
+  // Audit
+  const audit = state.audit || { stats: {}, recent: [] };
+  document.getElementById("auditCard").innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <strong>48h 连接审计（放行 ${audit.stats.allowed || 0} · 熔断 ${audit.stats.blocked || 0} · 异常 ${audit.stats.upstreamErrors || 0}）</strong>
+      <div class="btn-row">
+        <a href="/api/audit/csv?token=${TOKEN}" download="claude-env-audit.csv"><button>导出 CSV</button></a>
+        <button onclick="clearAudit()">清空日志</button>
+      </div>
+    </div>
+    <table><thead><tr><th>时间</th><th>目标主机</th><th>决策</th><th>出口</th><th>耗时</th></tr></thead>
+    <tbody>${(audit.recent || []).slice(0, 80).map(e => `
+      <tr>
+        <td class="mono">${new Date(e.startedAt).toLocaleTimeString()}</td>
+        <td class="mono">${esc(e.host)}:${e.port}</td>
+        <td class="${e.decision === "allowed" ? "ok" : "danger"}">${esc(e.decision)}</td>
+        <td class="mono">${esc(e.exitCountry || "")} ${esc(e.exitIP || "")}</td>
+        <td class="mono">${e.durationMs}ms</td>
+      </tr>`).join("") || `<tr><td colspan="5" class="muted">暂无记录</td></tr>`}</tbody></table>`;
+
+  // History
+  const hist = state.history || {};
+  document.getElementById("historyCard").innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <strong>48h 出口历史（采样 ${hist.sampleCount || 0} · 独立 IP ${hist.uniqueIPCount || 0} · 跨国切换 ${hist.countryChanges || 0}）</strong>
+      <button onclick="clearHistory()">清空历史</button>
+    </div>
+    <table><thead><tr><th>时间</th><th>出口 IP</th><th>地区</th><th>探测路径</th></tr></thead>
+    <tbody>${(hist.recentSamples || []).map(s => `
+      <tr>
+        <td class="mono">${new Date(s.capturedAt).toLocaleString()}</td>
+        <td class="mono">${esc(s.ip)}</td>
+        <td>${esc(s.countryCode)}</td>
+        <td class="muted">${esc(s.probePath)}</td>
+      </tr>`).join("") || `<tr><td colspan="4" class="muted">暂无采样记录</td></tr>`}</tbody></table>`;
+}
+
+refresh();
+setInterval(refresh, 8000);
+</script>
+</body>
+</html>

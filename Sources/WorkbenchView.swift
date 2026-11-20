@@ -31,11 +31,17 @@ final class WorkbenchController: ObservableObject {
     @Published private(set) var updateResult: ReleaseCheckResult?
     @Published private(set) var updateError: String?
 
+    @Published private(set) var shellGuardStatus: TerminalGuardStatus = .notInstalled
+    @Published private(set) var shellGuardNote: String?
+    @Published private(set) var shellGuardError: String?
+    @Published var copiedShellAlias: Bool = false
+
     private var trackedBrowserProcess: Process?
 
     init() {
         let saved = UserDefaults.standard.string(forKey: Self.updateRepoKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.updateRepoSlug = saved.isEmpty ? "clipsone/claude-env-check" : saved
+        self.shellGuardStatus = TerminalShellGuard.inspectStatus()
     }
 
     var selectedBrowser: DiscoveredBrowser? {
@@ -51,7 +57,47 @@ final class WorkbenchController: ObservableObject {
 
     func refreshAll() async {
         refreshBrowsers()
+        refreshShellGuard()
         await refreshDesktop()
+    }
+
+    func refreshShellGuard() {
+        shellGuardStatus = TerminalShellGuard.inspectStatus()
+    }
+
+    func installShellGuard() {
+        shellGuardError = nil
+        shellGuardNote = nil
+        do {
+            let url = try TerminalShellGuard.install()
+            refreshShellGuard()
+            shellGuardNote = "已安装终端防漏安全壳至 \(url.path)。运行 claude-safe 或配置 alias 后，每次启动 Claude Code 前都会先核验本地熔断守卫。"
+        } catch {
+            shellGuardError = error.localizedDescription
+        }
+    }
+
+    func uninstallShellGuard() {
+        shellGuardError = nil
+        shellGuardNote = nil
+        do {
+            try TerminalShellGuard.uninstall()
+            refreshShellGuard()
+            shellGuardNote = "已卸载 ~/.local/bin/claude-safe。"
+        } catch {
+            shellGuardError = error.localizedDescription
+        }
+    }
+
+    func copyShellAliasSnippet() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(TerminalShellGuard.shellAliasSnippet(), forType: .string)
+        copiedShellAlias = true
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            copiedShellAlias = false
+        }
     }
 
     func refreshBrowsers() {
@@ -267,6 +313,8 @@ struct WorkbenchView: View {
 
             isolatedBrowserCard
             claudeDesktopCard
+            terminalShellGuardCard
+            loginItemAndAutoGuardCard
             releaseUpdateCard
         }
         .confirmationDialog("将选中的 Claude Desktop 数据移入废纸篓？", isPresented: $workbench.confirmTrashDesktopItems, titleVisibility: .visible) {
@@ -516,7 +564,145 @@ struct WorkbenchView: View {
         .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(.quaternary) }
     }
 
-    // MARK: - 3. Passive GitHub Releases Update Checker
+    // MARK: - 3. Terminal Anti-Leak Shell Guard (claude-safe)
+
+    private var terminalShellGuardCard: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Label("终端防漏安全壳（claude-safe）", systemImage: "terminal.fill")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                switch workbench.shellGuardStatus {
+                case .installed:
+                    Text("已安装")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.teal)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(.teal.opacity(0.12), in: Capsule())
+                case .notInstalled:
+                    Text("未安装")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                case .foreignFileExists:
+                    Text("存在外部同名文件")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Text("在 ~/.local/bin/claude-safe 安装轻量校验壳（< 50ms 本地探测 /__claude_guard_health，零外网流量）：每次启动 Claude Code 前自动确认本地熔断守卫活着且未熔断，防止忘开守卫裸连出去。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                switch workbench.shellGuardStatus {
+                case .notInstalled:
+                    Button {
+                        workbench.installShellGuard()
+                    } label: {
+                        Label("一键安装 claude-safe", systemImage: "bolt.shield")
+                    }
+                    .buttonStyle(.borderedProminent)
+                case .installed:
+                    Button("更新脚本") {
+                        workbench.installShellGuard()
+                    }
+                    Button("卸载安全壳", role: .destructive) {
+                        workbench.uninstallShellGuard()
+                    }
+                case .foreignFileExists(let path):
+                    Text("已有非本工具文件：\(path)")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                Spacer()
+
+                Button {
+                    workbench.copyShellAliasSnippet()
+                } label: {
+                    Label(workbench.copiedShellAlias ? "已复制 ~/.zshrc 别名" : "复制 alias claude='claude-safe'",
+                          systemImage: workbench.copiedShellAlias ? "checkmark" : "doc.on.doc")
+                }
+            }
+
+            Text(verbatim: TerminalShellGuard.shellAliasSnippet())
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary) }
+
+            if let err = workbench.shellGuardError {
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            } else if let note = workbench.shellGuardNote {
+                Text(note).font(.callout).foregroundStyle(.teal)
+            }
+        }
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
+        .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(.quaternary) }
+    }
+
+    // MARK: - 4. Login Item & Auto-Guard
+
+    private var loginItemAndAutoGuardCard: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Label("开机静默常驻与自动护卫（SMAppService · 零 Root）", systemImage: "power.circle")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(guardEngine.loginItemState.label)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(guardEngine.loginItemState.isEnabled ? .teal : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background((guardEngine.loginItemState.isEnabled ? Color.teal : Color.secondary).opacity(0.12), in: Capsule())
+            }
+
+            Text("使用 macOS 原生 SMAppService 登记用户级登录项（绝不装 Root 守护进程）。开启自动护卫后，开机启动时将自动等待代理客户端就绪（最多 20 秒）并自动拉起本地熔断守卫。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 16) {
+                Toggle("开机自动启动并常驻菜单栏", isOn: Binding(
+                    get: { guardEngine.loginItemState.isEnabled },
+                    set: { guardEngine.setLoginItemEnabled($0) }
+                ))
+                .toggleStyle(.checkbox)
+
+                Toggle("启动后自动等待代理就绪并开启熔断守卫", isOn: $guardEngine.autoStartGuardOnLaunch)
+                    .toggleStyle(.checkbox)
+
+                Spacer()
+
+                Button("刷新状态") {
+                    guardEngine.refreshLoginItemState()
+                }
+                .controlSize(.small)
+            }
+            .font(.callout)
+
+            if let err = guardEngine.loginItemError {
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            } else if let note = guardEngine.loginItemNote {
+                Text(note).font(.callout).foregroundStyle(.teal)
+            }
+        }
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
+        .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(.quaternary) }
+    }
+
+    // MARK: - 5. Passive GitHub Releases Update Checker
 
     private var releaseUpdateCard: some View {
         VStack(alignment: .leading, spacing: 10) {

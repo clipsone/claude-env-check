@@ -3,6 +3,7 @@ build/
 *.app/
 *.dmg
 *.pkg
+*.exe
 
 # macOS & IDE metadata
 .DS_Store

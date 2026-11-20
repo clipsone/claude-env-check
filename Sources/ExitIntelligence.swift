@@ -232,10 +232,13 @@ enum ExitProbes {
     private static let ipifyV4URL = URL(string: "https://api4.ipify.org?format=json")!
     private static let ipifyV6URL = URL(string: "https://api6.ipify.org?format=json")!
 
-    static func probeMultiSourceGeo(proxyPort: Int?) async -> MultiSourceGeoReport {
-        async let cf = fetchCloudflareTrace(proxyPort: proxyPort)
-        async let ipWho = fetchIPWho(ip: nil, proxyPort: proxyPort)
-        async let third = fetchIPInfoOrFallback(ip: nil, proxyPort: proxyPort)
+    static func probeMultiSourceGeo(
+        proxyPort: Int?,
+        proxyProtocol: UpstreamProxyProtocol = .httpConnect
+    ) async -> MultiSourceGeoReport {
+        async let cf = fetchCloudflareTrace(proxyPort: proxyPort, proxyProtocol: proxyProtocol)
+        async let ipWho = fetchIPWho(ip: nil, proxyPort: proxyPort, proxyProtocol: proxyProtocol)
+        async let third = fetchIPInfoOrFallback(ip: nil, proxyPort: proxyPort, proxyProtocol: proxyProtocol)
 
         let sources = [await ipWho, await third, await cf]
         let usable = sources.filter(\.isUsable)
@@ -368,9 +371,9 @@ enum ExitProbes {
 
     // MARK: - HTTP Geo Providers
 
-    private static func fetchCloudflareTrace(proxyPort: Int?) async -> GeoSourceResult {
+    private static func fetchCloudflareTrace(proxyPort: Int?, proxyProtocol: UpstreamProxyProtocol = .httpConnect) async -> GeoSourceResult {
         do {
-            let (data, response) = try await Diagnostics.httpRequest(cfTraceURL, proxyPort: proxyPort, timeout: 6)
+            let (data, response) = try await Diagnostics.httpRequest(cfTraceURL, proxyPort: proxyPort, proxyProtocol: proxyProtocol, timeout: 6)
             guard response.statusCode == 200, let text = String(data: data, encoding: .utf8) else {
                 return GeoSourceResult(source: "Cloudflare Trace", ip: nil, countryCode: nil, regionName: nil, city: nil,
                                        asn: nil, org: nil, timeZone: nil, colo: nil, warp: nil,
@@ -404,7 +407,7 @@ enum ExitProbes {
         }
     }
 
-    private static func fetchIPWho(ip: String?, proxyPort: Int?) async -> GeoSourceResult {
+    private static func fetchIPWho(ip: String?, proxyPort: Int?, proxyProtocol: UpstreamProxyProtocol = .httpConnect) async -> GeoSourceResult {
         let url: URL
         if let ip, let encoded = ip.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
            let built = URL(string: "https://ipwho.is/\(encoded)") {
@@ -414,7 +417,7 @@ enum ExitProbes {
         }
         do {
             let (data, response) = try await Diagnostics.httpRequest(url, headers: ["Accept": "application/json"],
-                                                                     proxyPort: proxyPort, timeout: 6)
+                                                                     proxyPort: proxyPort, proxyProtocol: proxyProtocol, timeout: 6)
             guard response.statusCode == 200,
                   let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 return GeoSourceResult(source: "ipwho.is", ip: nil, countryCode: nil, regionName: nil, city: nil,
@@ -455,14 +458,14 @@ enum ExitProbes {
         }
     }
 
-    private static func fetchIPInfoOrFallback(ip: String?, proxyPort: Int?) async -> GeoSourceResult {
-        let info = await fetchIPInfo(ip: ip, proxyPort: proxyPort)
+    private static func fetchIPInfoOrFallback(ip: String?, proxyPort: Int?, proxyProtocol: UpstreamProxyProtocol = .httpConnect) async -> GeoSourceResult {
+        let info = await fetchIPInfo(ip: ip, proxyPort: proxyPort, proxyProtocol: proxyProtocol)
         if info.isUsable { return info }
-        let sb = await fetchIPSB(ip: ip, proxyPort: proxyPort)
+        let sb = await fetchIPSB(ip: ip, proxyPort: proxyPort, proxyProtocol: proxyProtocol)
         return sb.isUsable ? sb : info
     }
 
-    private static func fetchIPInfo(ip: String?, proxyPort: Int?) async -> GeoSourceResult {
+    private static func fetchIPInfo(ip: String?, proxyPort: Int?, proxyProtocol: UpstreamProxyProtocol = .httpConnect) async -> GeoSourceResult {
         let url: URL
         if let ip, let encoded = ip.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
            let built = URL(string: "https://ipinfo.io/\(encoded)/json") {
@@ -472,7 +475,7 @@ enum ExitProbes {
         }
         do {
             let (data, response) = try await Diagnostics.httpRequest(url, headers: ["Accept": "application/json"],
-                                                                     proxyPort: proxyPort, timeout: 6)
+                                                                     proxyPort: proxyPort, proxyProtocol: proxyProtocol, timeout: 6)
             guard response.statusCode == 200,
                   let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 return GeoSourceResult(source: "ipinfo.io", ip: nil, countryCode: nil, regionName: nil, city: nil,
@@ -513,7 +516,7 @@ enum ExitProbes {
         }
     }
 
-    private static func fetchIPSB(ip: String?, proxyPort: Int?) async -> GeoSourceResult {
+    private static func fetchIPSB(ip: String?, proxyPort: Int?, proxyProtocol: UpstreamProxyProtocol = .httpConnect) async -> GeoSourceResult {
         let url: URL
         if let ip, let encoded = ip.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
            let built = URL(string: "https://api.ip.sb/geoip/\(encoded)") {
@@ -524,8 +527,9 @@ enum ExitProbes {
         do {
             let (data, response) = try await Diagnostics.httpRequest(
                 url,
-                headers: ["Accept": "application/json", "User-Agent": "ClaudeEnvironmentCheck/0.3"],
+                headers: ["Accept": "application/json", "User-Agent": "ClaudeEnvironmentCheck/1.2"],
                 proxyPort: proxyPort,
+                proxyProtocol: proxyProtocol,
                 timeout: 6
             )
             guard response.statusCode == 200,

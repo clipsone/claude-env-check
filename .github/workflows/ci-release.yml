@@ -1,0 +1,70 @@
+name: Build, Test & Dual-Platform Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS (Swift 6 arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Swift 6 Test Suite & Build DMG
+        run: bash build.sh --test --dmg
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: build/*.dmg
+
+  windows:
+    name: Windows (Go Zero-Admin amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run Go Unit Tests
+        working-directory: windows
+        run: go test -v ./...
+      - name: Build Windows Standalone EXE
+        working-directory: windows
+        shell: bash
+        run: |
+          VERSION="$(grep -A1 CFBundleShortVersionString ../Info.plist | tail -n1 | sed -E 's/.*<string>(.*)<\/string>.*/\1/')"
+          mkdir -p ../build
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui" -o "../build/Claude-Environment-Check-${VERSION}-windows-amd64.exe" ./cmd/claude-env-check
+      - name: Upload Windows EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: build/*.exe
+
+  release:
+    name: Publish GitHub Release
+    needs: [ macos, windows ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -498,7 +498,7 @@ private struct CheckView: View {
                             Text("Claude 环境体检")
                                 .font(.system(size: 26, weight: .semibold))
                                 .accessibilityAddTraits(.isHeader)
-                            Text("v1.1.2")
+                            Text("v1.2.0")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.teal)
                                 .padding(.horizontal, 7)
@@ -628,7 +628,7 @@ private struct CheckView: View {
                 groupCard(
                     "出口合规与稳定性",
                     icon: "globe.asia.australia",
-                    ids: [.claudeWeb, .geoConsensus, .exitQuality, .ipv6Leak, .exitDrift],
+                    ids: [.claudeWeb, .geoConsensus, .exitQuality, .ipReputation, .ipv6Leak, .exitDrift],
                     snapshot: current
                 )
                 groupCard(
@@ -777,7 +777,8 @@ private struct CheckView: View {
                 Divider()
                 HStack(spacing: 14) {
                     if let gPort = guardEngine.guardPort, let uPort = guardEngine.upstreamPort {
-                        Label("127.0.0.1:\(String(gPort)) → 上游 :\(String(uPort))", systemImage: "arrow.triangle.branch")
+                        let protoPrefix = guardEngine.upstreamProtocol == .socks5 ? "SOCKS5 " : "上游 "
+                        Label("127.0.0.1:\(String(gPort)) → \(protoPrefix):\(String(uPort))", systemImage: "arrow.triangle.branch")
                             .font(.system(.caption, design: .monospaced))
                     }
                     if let ip = guardEngine.lastVerifiedIP {

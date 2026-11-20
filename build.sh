@@ -41,8 +41,11 @@ trap 'rm -rf "$staging_dir"' EXIT
 version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$project_dir/Info.plist")"
 app_name="Claude 环境体检.app"
 staging_app="$staging_dir/$app_name"
-mkdir -p "$staging_app/Contents/MacOS"
+mkdir -p "$staging_app/Contents/MacOS" "$staging_app/Contents/Resources"
 /bin/cp "$project_dir/Info.plist" "$staging_app/Contents/Info.plist"
+if [ -f "$project_dir/Resources/AppIcon.icns" ]; then
+    /bin/cp "$project_dir/Resources/AppIcon.icns" "$staging_app/Contents/Resources/AppIcon.icns"
+fi
 /usr/bin/xcrun swiftc \
     -swift-version 6 \
     -target arm64-apple-macos13.0 \

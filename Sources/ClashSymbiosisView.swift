@@ -88,17 +88,11 @@ struct ClashSymbiosisView: View {
                             Text(verbatim: "127.0.0.1:\(String(client.port))")
                                 .font(.system(.callout, design: .monospaced))
                                 .textSelection(.enabled)
-                            if client.protocols.supportsHTTP {
-                                Button("设为上游") {
-                                    guardEngine.adoptDiscoveredPort(client.port)
-                                }
-                                .controlSize(.small)
-                                .disabled(guardEngine.isGuardProxyRunning)
-                            } else {
-                                Text("仅 SOCKS5")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                            Button(client.protocols.supportsHTTP ? "设为上游" : "设为 SOCKS5 上游") {
+                                guardEngine.adoptDiscoveredPort(client.port)
                             }
+                            .controlSize(.small)
+                            .disabled(guardEngine.isGuardProxyRunning)
                         }
                         .padding(.vertical, 8)
                     }
@@ -327,23 +321,31 @@ struct ClashSymbiosisView: View {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
-                        Label("懒人一键写入 Clash Verge 防泄漏扩展脚本", systemImage: "wand.and.stars")
+                        Label("懒人一键写入代理客户端防泄漏脚本", systemImage: "wand.and.stars")
                             .font(.subheadline.weight(.semibold))
                         scriptStatusBadge
                     }
-                    Text("自动写入 Clash Verge 全局扩展脚本（profiles/Script.js）并原子备份原脚本：自动置顶你当前合规节点、创建 Claude-Pin 手动组、屏蔽 QUIC/STUN，并把海外与 Claude DNS 锁至代理远端 DoH 根治 DNS/ECS 泄漏")
+                    Text("兼容 Clash Verge Rev / 旧版 Clash Verge / Mihomo Party / FlClash：自动备份原脚本并串联保留原逻辑，置顶当前合规节点、创建 Claude-Pin 固定组、屏蔽 QUIC/STUN，并将海外与 Claude DNS 锁至代理远端 DoH")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
+                Picker("目标客户端", selection: $guardEngine.selectedScriptTarget) {
+                    ForEach(ProxyScriptTarget.allCases) { target in
+                        let installed = guardEngine.installedScriptTargets.contains(target)
+                        Text("\(target.displayName)\(installed ? "" : "（未安装）")").tag(target)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 195)
             }
 
-            // Lazy 1-click Clash Verge action bar
+            // Lazy 1-click multi-client action bar
             HStack(spacing: 10) {
                 switch guardEngine.clashScriptStatus {
                 case .vergeNotInstalled:
-                    Text("未检测到 Clash Verge Rev 配置目录，可使用下方按钮手动复制规则")
+                    Text("未检测到 \(guardEngine.selectedScriptTarget.displayName) 配置目录，可切换其他客户端或手动复制代码")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -351,7 +353,7 @@ struct ClashSymbiosisView: View {
                     Button {
                         guardEngine.installVergeScript()
                     } label: {
-                        Label("一键写入 Clash Verge", systemImage: "bolt.fill")
+                        Label("一键写入 \(guardEngine.selectedScriptTarget.displayName)", systemImage: "bolt.fill")
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -372,7 +374,7 @@ struct ClashSymbiosisView: View {
                     Button {
                         guardEngine.openClashVergeForReload()
                     } label: {
-                        Label(activeInKernel ? "打开 Clash Verge" : "打开 Clash Verge 重载生效", systemImage: "arrow.up.forward.app")
+                        Label(activeInKernel ? "打开 \(guardEngine.selectedScriptTarget.displayName)" : "打开 \(guardEngine.selectedScriptTarget.displayName) 重载生效", systemImage: "arrow.up.forward.app")
                     }
 
                     Button("一键还原原始脚本") {
@@ -405,7 +407,7 @@ struct ClashSymbiosisView: View {
             if case .installed(_, let activeInKernel) = guardEngine.clashScriptStatus, !activeInKernel {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle.fill").foregroundStyle(.orange)
-                    Text("脚本已写入 profiles/Script.js，但 Clash Verge 内核尚未加载 Claude-Pin：点「打开 Clash Verge 重载生效」后在订阅页点一下当前订阅右侧的刷新/重新启用图标，再回到本页点「刷新扫描」即可看到变绿生效。")
+                    Text("脚本已写入 \(guardEngine.selectedScriptTarget.relativeScriptPath)，但内核尚未加载 Claude-Pin：\(guardEngine.selectedScriptTarget.reloadHint)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

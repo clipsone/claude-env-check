@@ -1,5 +1,18 @@
+import Darwin
 import Foundation
 import Network
+
+enum UpstreamProxyProtocol: String, Codable, Sendable {
+    case httpConnect
+    case socks5
+
+    var shortLabel: String {
+        switch self {
+        case .httpConnect: "HTTP"
+        case .socks5: "SOCKS5"
+        }
+    }
+}
 
 enum BreakerGateState: Equatable, Sendable {
     case open(exitIP: String?, countryCode: String?)
@@ -76,6 +89,7 @@ final class CircuitBreakerProxy: @unchecked Sendable {
     private var listener: NWListener?
     private var boundPort: Int?
     private var upstreamPort: Int = 0
+    private var upstreamProtocol: UpstreamProxyProtocol = .httpConnect
     private var gateState: BreakerGateState = .tripped(reason: "尚未完成出口校验")
     private var activeTunnels: [UUID: TunnelPair] = [:]
     private var isStopped = false
@@ -127,13 +141,19 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         }
     }
 
-    func updateUpstreamPort(_ port: Int) {
+    func updateUpstreamPort(_ port: Int, protocol proto: UpstreamProxyProtocol = .httpConnect) {
         lock.lock()
         upstreamPort = port
+        upstreamProtocol = proto
         lock.unlock()
     }
 
-    func start(preferredPort: Int = 17899, upstreamPort: Int, initialState: BreakerGateState) async throws -> Int {
+    func start(
+        preferredPort: Int = 17899,
+        upstreamPort: Int,
+        upstreamProtocol: UpstreamProxyProtocol = .httpConnect,
+        initialState: BreakerGateState
+    ) async throws -> Int {
         guard (1...65535).contains(upstreamPort) else {
             throw CircuitBreakerError.invalidUpstreamPort
         }
@@ -142,6 +162,7 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         lock.withLock {
             self.isStopped = false
             self.upstreamPort = upstreamPort
+            self.upstreamProtocol = upstreamProtocol
             self.gateState = initialState
         }
 
@@ -255,6 +276,13 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         let startedAt = Date()
         let startInstant = ContinuousClock.now
 
+        // Fast local-only health check for terminal `claude-safe` wrapper (<5ms, zero upstream traffic)
+        if let first = Self.firstLine(of: headerData),
+           (first.hasPrefix("GET /__claude_guard_health ") || first.hasPrefix("HEAD /__claude_guard_health ")) {
+            respondHealthCheck(client: client)
+            return
+        }
+
         guard let parsed = Self.parseHTTPProxyRequest(headerData) else {
             sendSimpleHTTPResponse(client: client, status: "400 Bad Request", body: "Malformed proxy request.\n")
             return
@@ -285,9 +313,11 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         // Circuit-breaker check
         let snapshotGate: BreakerGateState
         let currentUpstreamPort: Int
+        let currentUpstreamProto: UpstreamProxyProtocol
         lock.lock()
         snapshotGate = gateState
         currentUpstreamPort = upstreamPort
+        currentUpstreamProto = upstreamProtocol
         lock.unlock()
 
         switch snapshotGate {
@@ -323,6 +353,7 @@ final class CircuitBreakerProxy: @unchecked Sendable {
                     port: parsed.port,
                     trailingClientBytes: trailingData,
                     upstreamPort: currentUpstreamPort,
+                    upstreamProtocol: currentUpstreamProto,
                     startedAt: startedAt,
                     startInstant: startInstant,
                     isClaude: isClaude,
@@ -335,6 +366,7 @@ final class CircuitBreakerProxy: @unchecked Sendable {
                     parsed: parsed,
                     rawRequest: headerData + trailingData,
                     upstreamPort: currentUpstreamPort,
+                    upstreamProtocol: currentUpstreamProto,
                     startedAt: startedAt,
                     startInstant: startInstant,
                     isClaude: isClaude,
@@ -345,12 +377,44 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         }
     }
 
+    private func respondHealthCheck(client: NWConnection) {
+        let (state, proto, upPort): (BreakerGateState, UpstreamProxyProtocol, Int) = lock.withLock {
+            (gateState, upstreamProtocol, upstreamPort)
+        }
+        let esc: (String) -> String = { s in
+            s.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: " ")
+        }
+        switch state {
+        case let .open(ip, cc):
+            let json = "{\"state\":\"open\",\"ip\":\"\(esc(ip ?? ""))\",\"country\":\"\(esc(cc ?? ""))\",\"upstreamPort\":\(upPort),\"upstreamProtocol\":\"\(proto.rawValue)\"}\n"
+            sendSimpleHTTPResponse(
+                client: client,
+                status: "200 OK",
+                contentType: "application/json; charset=utf-8",
+                extraHeaders: ["X-Claude-EnvCheck-Breaker": "open"],
+                body: json
+            )
+        case .tripped(let reason):
+            let json = "{\"state\":\"tripped\",\"reason\":\"\(esc(reason))\",\"upstreamPort\":\(upPort),\"upstreamProtocol\":\"\(proto.rawValue)\"}\n"
+            sendSimpleHTTPResponse(
+                client: client,
+                status: "503 Service Unavailable",
+                contentType: "application/json; charset=utf-8",
+                extraHeaders: ["X-Claude-EnvCheck-Breaker": "tripped"],
+                body: json
+            )
+        }
+    }
+
     private func handleConnectTunnel(
         client: NWConnection,
         host: String,
         port: Int,
         trailingClientBytes: Data,
         upstreamPort: Int,
+        upstreamProtocol: UpstreamProxyProtocol,
         startedAt: Date,
         startInstant: ContinuousClock.Instant,
         isClaude: Bool,
@@ -384,94 +448,123 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         handshake.attachTimer(timer)
         timer.resume()
 
+        let establishRelay: @Sendable (Data) -> Void = { [weak self] trailingUpstreamBytes in
+            guard let self else {
+                client.cancel()
+                upstream.cancel()
+                return
+            }
+            if !self.currentGateState.isOpen {
+                self.unregisterTunnel(tunnelID)
+                upstream.cancel()
+                self.sendSimpleHTTPResponse(client: client, status: "503 Service Unavailable", body: "Breaker tripped during handshake.\n")
+                return
+            }
+            let established = Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)
+            client.send(content: established, completion: .contentProcessed { clientSendErr in
+                if clientSendErr != nil {
+                    self.unregisterTunnel(tunnelID)
+                    client.cancel()
+                    upstream.cancel()
+                    return
+                }
+                self.beginRelay(
+                    tunnelID: tunnelID,
+                    client: client,
+                    upstream: upstream,
+                    initialToUpstream: trailingClientBytes,
+                    initialToClient: trailingUpstreamBytes,
+                    method: "CONNECT",
+                    host: host,
+                    port: port,
+                    isClaude: isClaude,
+                    startedAt: startedAt,
+                    startInstant: startInstant,
+                    exitIP: exitIP,
+                    exitCountry: exitCountry
+                )
+            })
+        }
+
         upstream.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
-                let formattedHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
-                let connectReq = "CONNECT \(formattedHost):\(port) HTTP/1.1\r\nHost: \(formattedHost):\(port)\r\nProxy-Connection: Keep-Alive\r\n\r\n"
-                upstream.send(content: Data(connectReq.utf8), completion: .contentProcessed { sendErr in
-                    if let sendErr {
+                switch upstreamProtocol {
+                case .socks5:
+                    self.performSOCKS5Handshake(upstream: upstream, host: host, port: port) { result in
                         guard handshake.claim() else { return }
-                        self.unregisterTunnel(tunnelID)
-                        upstream.cancel()
-                        self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream send error.\n")
-                        self.emitAudit(
-                            startedAt: startedAt, method: "CONNECT", host: host, port: port, isClaude: isClaude,
-                            decision: .upstreamError, reason: "发送上游 CONNECT 失败：\(sendErr.localizedDescription)",
-                            exitIP: exitIP, exitCountry: exitCountry, bytesUp: 0, bytesDown: 0,
-                            durationMs: self.elapsedMs(since: startInstant)
-                        )
-                        self.onUpstreamFailure("上游代理通信失败")
-                        return
-                    }
-
-                    self.readHeaderBlock(from: upstream, accumulated: Data()) { respResult in
-                        guard handshake.claim() else { return }
-
-                        switch respResult {
-                        case .failure(let err):
+                        switch result {
+                        case .failure(let reason):
                             self.unregisterTunnel(tunnelID)
                             upstream.cancel()
-                            self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream handshake failed.\n")
+                            self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream SOCKS5 failed: \(reason)\n")
                             self.emitAudit(
                                 startedAt: startedAt, method: "CONNECT", host: host, port: port, isClaude: isClaude,
-                                decision: .upstreamError, reason: "上游代理响应异常：\(err)",
+                                decision: .upstreamError, reason: "上游 SOCKS5 握手失败：\(reason)",
                                 exitIP: exitIP, exitCountry: exitCountry, bytesUp: 0, bytesDown: 0,
                                 durationMs: self.elapsedMs(since: startInstant)
                             )
-                            self.onUpstreamFailure("上游代理握手异常")
+                            self.onUpstreamFailure("上游 SOCKS5 握手失败")
+                        case .success(let trailingUpstreamBytes):
+                            establishRelay(trailingUpstreamBytes)
+                        }
+                    }
 
-                        case let .success((respHeader, trailingUpstreamBytes)):
-                            guard Self.isHTTP200Response(respHeader) else {
-                                let statusLine = Self.firstLine(of: respHeader) ?? "non-200"
+                case .httpConnect:
+                    let formattedHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+                    let connectReq = "CONNECT \(formattedHost):\(port) HTTP/1.1\r\nHost: \(formattedHost):\(port)\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+                    upstream.send(content: Data(connectReq.utf8), completion: .contentProcessed { sendErr in
+                        if let sendErr {
+                            guard handshake.claim() else { return }
+                            self.unregisterTunnel(tunnelID)
+                            upstream.cancel()
+                            self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream send error.\n")
+                            self.emitAudit(
+                                startedAt: startedAt, method: "CONNECT", host: host, port: port, isClaude: isClaude,
+                                decision: .upstreamError, reason: "发送上游 CONNECT 失败：\(sendErr.localizedDescription)",
+                                exitIP: exitIP, exitCountry: exitCountry, bytesUp: 0, bytesDown: 0,
+                                durationMs: self.elapsedMs(since: startInstant)
+                            )
+                            self.onUpstreamFailure("上游代理通信失败")
+                            return
+                        }
+
+                        self.readHeaderBlock(from: upstream, accumulated: Data()) { respResult in
+                            guard handshake.claim() else { return }
+
+                            switch respResult {
+                            case .failure(let err):
                                 self.unregisterTunnel(tunnelID)
                                 upstream.cancel()
-                                self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream rejected CONNECT: \(statusLine)\n")
+                                self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream handshake failed.\n")
                                 self.emitAudit(
                                     startedAt: startedAt, method: "CONNECT", host: host, port: port, isClaude: isClaude,
-                                    decision: .upstreamError, reason: "上游拒绝隧道：\(statusLine)",
+                                    decision: .upstreamError, reason: "上游代理响应异常：\(err)",
                                     exitIP: exitIP, exitCountry: exitCountry, bytesUp: 0, bytesDown: 0,
                                     durationMs: self.elapsedMs(since: startInstant)
                                 )
-                                return
-                            }
+                                self.onUpstreamFailure("上游代理握手异常")
 
-                            // Re-check breaker gate right before confirming tunnel establishment
-                            if !self.currentGateState.isOpen {
-                                self.unregisterTunnel(tunnelID)
-                                upstream.cancel()
-                                self.sendSimpleHTTPResponse(client: client, status: "503 Service Unavailable", body: "Breaker tripped during handshake.\n")
-                                return
-                            }
-
-                            let established = Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)
-                            client.send(content: established, completion: .contentProcessed { clientSendErr in
-                                if clientSendErr != nil {
+                            case let .success((respHeader, trailingUpstreamBytes)):
+                                guard Self.isHTTP200Response(respHeader) else {
+                                    let statusLine = Self.firstLine(of: respHeader) ?? "non-200"
                                     self.unregisterTunnel(tunnelID)
-                                    client.cancel()
                                     upstream.cancel()
+                                    self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream rejected CONNECT: \(statusLine)\n")
+                                    self.emitAudit(
+                                        startedAt: startedAt, method: "CONNECT", host: host, port: port, isClaude: isClaude,
+                                        decision: .upstreamError, reason: "上游拒绝隧道：\(statusLine)",
+                                        exitIP: exitIP, exitCountry: exitCountry, bytesUp: 0, bytesDown: 0,
+                                        durationMs: self.elapsedMs(since: startInstant)
+                                    )
                                     return
                                 }
-                                self.beginRelay(
-                                    tunnelID: tunnelID,
-                                    client: client,
-                                    upstream: upstream,
-                                    initialToUpstream: trailingClientBytes,
-                                    initialToClient: trailingUpstreamBytes,
-                                    method: "CONNECT",
-                                    host: host,
-                                    port: port,
-                                    isClaude: isClaude,
-                                    startedAt: startedAt,
-                                    startInstant: startInstant,
-                                    exitIP: exitIP,
-                                    exitCountry: exitCountry
-                                )
-                            })
+                                establishRelay(trailingUpstreamBytes)
+                            }
                         }
-                    }
-                })
+                    })
+                }
 
             case .failed(let err):
                 guard handshake.claim() else { return }
@@ -498,6 +591,7 @@ final class CircuitBreakerProxy: @unchecked Sendable {
         parsed: ParsedProxyRequest,
         rawRequest: Data,
         upstreamPort: Int,
+        upstreamProtocol: UpstreamProxyProtocol,
         startedAt: Date,
         startInstant: ContinuousClock.Instant,
         isClaude: Bool,
@@ -517,21 +611,57 @@ final class CircuitBreakerProxy: @unchecked Sendable {
             switch state {
             case .ready:
                 guard connectOnce.claim() else { return }
-                self.beginRelay(
-                    tunnelID: tunnelID,
-                    client: client,
-                    upstream: upstream,
-                    initialToUpstream: rawRequest,
-                    initialToClient: Data(),
-                    method: parsed.method,
-                    host: parsed.host,
-                    port: parsed.port,
-                    isClaude: isClaude,
-                    startedAt: startedAt,
-                    startInstant: startInstant,
-                    exitIP: exitIP,
-                    exitCountry: exitCountry
-                )
+                switch upstreamProtocol {
+                case .httpConnect:
+                    self.beginRelay(
+                        tunnelID: tunnelID,
+                        client: client,
+                        upstream: upstream,
+                        initialToUpstream: rawRequest,
+                        initialToClient: Data(),
+                        method: parsed.method,
+                        host: parsed.host,
+                        port: parsed.port,
+                        isClaude: isClaude,
+                        startedAt: startedAt,
+                        startInstant: startInstant,
+                        exitIP: exitIP,
+                        exitCountry: exitCountry
+                    )
+                case .socks5:
+                    self.performSOCKS5Handshake(upstream: upstream, host: parsed.host, port: parsed.port) { result in
+                        switch result {
+                        case .failure(let reason):
+                            self.unregisterTunnel(tunnelID)
+                            upstream.cancel()
+                            self.sendSimpleHTTPResponse(client: client, status: "502 Bad Gateway", body: "Upstream SOCKS5 failed: \(reason)\n")
+                            self.emitAudit(
+                                startedAt: startedAt, method: parsed.method, host: parsed.host, port: parsed.port, isClaude: isClaude,
+                                decision: .upstreamError, reason: "上游 SOCKS5 失败：\(reason)",
+                                exitIP: exitIP, exitCountry: exitCountry, bytesUp: 0, bytesDown: 0,
+                                durationMs: self.elapsedMs(since: startInstant)
+                            )
+                            self.onUpstreamFailure("上游 SOCKS5 连接失败")
+                        case .success(let trailing):
+                            let originReq = Self.rewriteProxyRequestToOriginForm(rawRequest)
+                            self.beginRelay(
+                                tunnelID: tunnelID,
+                                client: client,
+                                upstream: upstream,
+                                initialToUpstream: originReq,
+                                initialToClient: trailing,
+                                method: parsed.method,
+                                host: parsed.host,
+                                port: parsed.port,
+                                isClaude: isClaude,
+                                startedAt: startedAt,
+                                startInstant: startInstant,
+                                exitIP: exitIP,
+                                exitCountry: exitCountry
+                            )
+                        }
+                    }
+                }
             case .failed(let err):
                 guard connectOnce.claim() else { return }
                 self.unregisterTunnel(tunnelID)
@@ -549,6 +679,185 @@ final class CircuitBreakerProxy: @unchecked Sendable {
             }
         }
         upstream.start(queue: queue)
+    }
+
+    // MARK: - Pure Swift RFC 1928 SOCKS5 Upstream Handshake
+
+    private enum SOCKS5HandshakeError: Error, CustomStringConvertible {
+        case failed(String)
+        var description: String {
+            if case .failed(let s) = self { return s }
+            return "unknown"
+        }
+    }
+
+    static func buildSOCKS5ConnectPacket(host: String, port: Int) -> Data? {
+        guard (1...65535).contains(port) else { return nil }
+        let cleaned = host.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+        var packet = Data([0x05, 0x01, 0x00])
+
+        var v4 = in_addr()
+        var v6 = in6_addr()
+        if cleaned.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
+            packet.append(0x01)
+            withUnsafeBytes(of: &v4) { packet.append(contentsOf: $0) }
+        } else if cleaned.withCString({ inet_pton(AF_INET6, $0, &v6) }) == 1 {
+            packet.append(0x04)
+            withUnsafeBytes(of: &v6) { packet.append(contentsOf: $0) }
+        } else {
+            let domainBytes = Data(cleaned.utf8)
+            guard !domainBytes.isEmpty, domainBytes.count <= 255 else { return nil }
+            packet.append(0x03)
+            packet.append(UInt8(domainBytes.count))
+            packet.append(domainBytes)
+        }
+        packet.append(UInt8((port >> 8) & 0xFF))
+        packet.append(UInt8(port & 0xFF))
+        return packet
+    }
+
+    private static func rewriteProxyRequestToOriginForm(_ rawRequest: Data) -> Data {
+        guard let range = rawRequest.range(of: Data([0x0D, 0x0A])) else { return rawRequest }
+        guard let firstLine = String(data: rawRequest[..<range.lowerBound], encoding: .isoLatin1) else { return rawRequest }
+        let parts = firstLine.split(separator: " ")
+        guard parts.count >= 3,
+              let url = URL(string: String(parts[1])),
+              url.scheme != nil else {
+            return rawRequest
+        }
+        var originPath = url.path.isEmpty ? "/" : url.path
+        if let q = url.query { originPath += "?\(q)" }
+        let rewritten = "\(parts[0]) \(originPath) \(parts[2])"
+        var out = Data(rewritten.utf8)
+        out.append(rawRequest[range.lowerBound...])
+        return out
+    }
+
+    private func performSOCKS5Handshake(
+        upstream: NWConnection,
+        host: String,
+        port: Int,
+        completion: @escaping @Sendable (Result<Data, SOCKS5HandshakeError>) -> Void
+    ) {
+        guard let connectPacket = Self.buildSOCKS5ConnectPacket(host: host, port: port) else {
+            completion(.failure(.failed("无效目标主机或端口")))
+            return
+        }
+        let greeting = Data([0x05, 0x01, 0x00])
+        upstream.send(content: greeting, completion: .contentProcessed { [weak self] err in
+            if let err {
+                completion(.failure(.failed("SOCKS5 问候发送失败：\(err.localizedDescription)")))
+                return
+            }
+            guard let self else {
+                completion(.failure(.failed("连接已释放")))
+                return
+            }
+            self.readAtLeast(from: upstream, minimum: 2, accumulated: Data()) { greetRes in
+                switch greetRes {
+                case .failure(let e):
+                    completion(.failure(.failed("SOCKS5 问候响应异常：\(e)")))
+                case .success(let buf):
+                    guard buf.count >= 2, buf[0] == 0x05, buf[1] == 0x00 else {
+                        let method = buf.count >= 2 ? buf[1] : 0xFF
+                        completion(.failure(.failed(method == 0xFF ? "上游 SOCKS5 需要鉴权（仅支持无鉴权本地代理）" : "上游非 SOCKS5 协议")))
+                        return
+                    }
+                    let extraAfterGreet = Data(buf.dropFirst(2))
+                    upstream.send(content: connectPacket, completion: .contentProcessed { sendErr in
+                        if let sendErr {
+                            completion(.failure(.failed("SOCKS5 CONNECT 发送失败：\(sendErr.localizedDescription)")))
+                            return
+                        }
+                        self.readAtLeast(from: upstream, minimum: 4, accumulated: extraAfterGreet) { headRes in
+                            switch headRes {
+                            case .failure(let e):
+                                completion(.failure(.failed("SOCKS5 响应头异常：\(e)")))
+                            case .success(let headBuf):
+                                guard headBuf[0] == 0x05 else {
+                                    completion(.failure(.failed("SOCKS5 协议版本异常")))
+                                    return
+                                }
+                                guard headBuf[1] == 0x00 else {
+                                    completion(.failure(.failed("SOCKS5 上游拒绝连接 (REP=0x\(String(format: "%02X", headBuf[1])))")))
+                                    return
+                                }
+                                let atyp = headBuf[3]
+                                let afterHeader = Data(headBuf.dropFirst(4))
+                                switch atyp {
+                                case 0x01: // IPv4 (4) + port (2)
+                                    self.readAtLeast(from: upstream, minimum: 6, accumulated: afterHeader) { r in
+                                        switch r {
+                                        case .failure(let e): completion(.failure(.failed("SOCKS5 IPv4 尾字节异常：\(e)")))
+                                        case .success(let tail): completion(.success(Data(tail.dropFirst(6))))
+                                        }
+                                    }
+                                case 0x04: // IPv6 (16) + port (2)
+                                    self.readAtLeast(from: upstream, minimum: 18, accumulated: afterHeader) { r in
+                                        switch r {
+                                        case .failure(let e): completion(.failure(.failed("SOCKS5 IPv6 尾字节异常：\(e)")))
+                                        case .success(let tail): completion(.success(Data(tail.dropFirst(18))))
+                                        }
+                                    }
+                                case 0x03: // 1 len byte + domain + 2 port bytes
+                                    self.readAtLeast(from: upstream, minimum: 1, accumulated: afterHeader) { lr in
+                                        switch lr {
+                                        case .failure(let e):
+                                            completion(.failure(.failed("SOCKS5 域名长度异常：\(e)")))
+                                        case .success(let lenBuf):
+                                            let need = Int(lenBuf[0]) + 2
+                                            self.readAtLeast(from: upstream, minimum: need, accumulated: Data(lenBuf.dropFirst(1))) { dr in
+                                                switch dr {
+                                                case .failure(let e): completion(.failure(.failed("SOCKS5 域名尾字节异常：\(e)")))
+                                                case .success(let tail): completion(.success(Data(tail.dropFirst(need))))
+                                                }
+                                            }
+                                        }
+                                    }
+                                default:
+                                    completion(.failure(.failed("未知 SOCKS5 地址类型 (0x\(String(format: "%02X", atyp)))")))
+                                }
+                            }
+                        }
+                    })
+                }
+            }
+        })
+    }
+
+    private func readAtLeast(
+        from connection: NWConnection,
+        minimum: Int,
+        accumulated: Data,
+        completion: @escaping @Sendable (Result<Data, HeaderReadError>) -> Void
+    ) {
+        if accumulated.count >= minimum {
+            completion(.success(accumulated))
+            return
+        }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+            guard let self else {
+                completion(.failure(.closed))
+                return
+            }
+            if let error {
+                completion(.failure(.transport(error.localizedDescription)))
+                return
+            }
+            var buffer = accumulated
+            if let data, !data.isEmpty {
+                buffer.append(data)
+            }
+            if buffer.count >= minimum {
+                completion(.success(buffer))
+                return
+            }
+            if isComplete || data == nil {
+                completion(.failure(.closed))
+                return
+            }
+            self.readAtLeast(from: connection, minimum: minimum, accumulated: buffer, completion: completion)
+        }
     }
 
     // MARK: - Bidirectional Tunnel Relay
@@ -710,11 +1019,12 @@ final class CircuitBreakerProxy: @unchecked Sendable {
     private func sendSimpleHTTPResponse(
         client: NWConnection,
         status: String,
+        contentType: String = "text/plain; charset=utf-8",
         extraHeaders: [String: String] = [:],
         body: String
     ) {
         let bodyData = Data(body.utf8)
-        var headerText = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(bodyData.count)\r\nConnection: close\r\n"
+        var headerText = "HTTP/1.1 \(status)\r\nContent-Type: \(contentType)\r\nContent-Length: \(bodyData.count)\r\nConnection: close\r\n"
         for (k, v) in extraHeaders {
             headerText += "\(k): \(v)\r\n"
         }
